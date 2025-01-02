@@ -71,6 +71,8 @@ SEAML1: `0xF01901ad15fcd248a7175E03c0ecCC0fD1D943Eb`
 | Timelock long              | `0xA96448469520666EDC351eff7676af2247b16718` | `0xBe170D7D3Cda6E9db39E012D0fE25aB83Fff790d` |
 | Governor long              | `0x04faA2826DbB38a7A4E9a5E3dB26b9E389E761B6` | `0x5acB96aAc90BF545500251D1eED10Bf47e996317` |
 | Airdrop                    |                                              | `0xB7A6531665c5e2B2d5b9Aa04636847c8F45c702B` |
+| Seam Emission Manager 1    | `0x57460DC21bf1574b8e6E00D372b8Ca5Ec41b3955` | `0x03eEEdf76A007Dce47B3a0044D9F0A04BaDD9CFA` |
+| Seam Emission Manager 2    | `0x785c979EE8709060b3f71aEf4f2C09229DB90778` | `0x1FDFC3872A70A7af5a818F27bb14fBEA4EE38f9c` |
 | SeamTransferStrategy       |                                              | `0x2b1bdeFCe33f34128759f71076eBd62637FD154C` |
 | EscrowSeamTransferStrategy |                                              | `0x2181be388ced00754E7c1Ee33DBcF78397DD89aC` |
 | ERC20TransferStrategy      |                                              | `0x003D47ddDdb070822B35ae5cc4F0066Cf9E89753` |

@@ -37,6 +37,8 @@ deploy-airdrop-base-mainnet	:; forge script script/SeamAirdropDeploy.s.sol:SeamA
 deploy-seam-l1-eth-testnet		:; forge script script/SeamL1Deploy.s.sol:SeamL1DeployScript --force --evm-version shanghai --rpc-url ${ETH_TESTNET_RPC_URL} --slow --broadcast --verify --delay 5 -vvvv
 deploy-seam-l1-eth-mainnet		:; forge script script/SeamL1Deploy.s.sol:SeamL1DeployScript --force --evm-version shanghai --rpc-url ${ETH_RPC_URL} --slow --broadcast --verify --delay 5 -vvvv
 
+deploy-seam-transfer-strategy-base-mainnet	:; forge script script/SeamTransferStrategy.s.sol:SeamTransferStrategyScript --force --rpc-url ${BASE_RPC_URL} --slow --broadcast --verify --delay 5 --verifier-url ${VERIFIER_URL} -vvvv
+
 deploy-escrow-seam-transfer-strategy-base-mainnet	:; forge script script/EscrowSeamTransferStrategy.s.sol:EscrowSeamTransferStrategyScript --force --rpc-url ${BASE_RPC_URL} --slow --broadcast --verify --delay 5 --verifier-url ${VERIFIER_URL} -vvvv
 deploy-escrow-seam-transfer-strategy-tenderly	:; forge script script/EscrowSeamTransferStrategy.s.sol:EscrowSeamTransferStrategyScript --force --rpc-url ${TENDERLY_FORK_RPC_URL} --slow --broadcast -vvvv
 
@@ -45,3 +47,4 @@ deploy-erc20-transfer-strategy-tenderly		:; forge script script/ERC20TransferStr
 
 deploy-escrow-seam-implementation-base-mainnet	:; forge script script/EscrowSeamImplementationDeploy.s.sol:EscrowSeamImplementationDeploy --force --rpc-url ${BASE_RPC_URL} --slow --broadcast --verify --delay 5 --verifier-url ${VERIFIER_URL} -vvvv
 deploy-escrow-seam-implementation-tenderly		:; forge script script/EscrowSeamImplementationDeploy.s.sol:EscrowSeamImplementationDeploy --force --rpc-url ${TENDERLY_FORK_RPC_URL} --slow --broadcast -vvvv
+

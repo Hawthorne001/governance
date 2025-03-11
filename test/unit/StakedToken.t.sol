@@ -2,728 +2,1282 @@
 pragma solidity ^0.8.20;
 
 import {Test, console} from "forge-std/Test.sol";
-import {StakedToken} from "../../src/safety-module/StakedToken.sol"; // Adjust import paths to your project structure
-import {IStakedToken} from "../../src/interfaces/IStakedToken.sol";
-import {StakedTokenStorage} from "../../src/storage/StakedTokenStorage.sol";
-import {ERC20Mock} from "openzeppelin-contracts/mocks/token/ERC20Mock.sol";
-import {IERC20} from "openzeppelin-contracts/token/ERC20/IERC20.sol";
-import {IRewardsController} from "@aave/periphery-v3/contracts/rewards/interfaces/IRewardsController.sol";
-import {ERC1967Proxy} from "openzeppelin-contracts/proxy/ERC1967/ERC1967Proxy.sol";
-import {PausableUpgradeable} from "openzeppelin-contracts-upgradeable/utils/PausableUpgradeable.sol";
-import {RewardsController} from "@aave/periphery-v3/contracts/rewards/RewardsController.sol";
-import {RewardKeeper} from "../../src/safety-module/RewardKeeper.sol";
-import {MockPool} from "../mocks/MockPool.sol";
-import {MockOracle} from "../mocks/MockOracle.sol";
-import {MockFactory} from "../mocks/MockFactory.sol";
-import {StakedTokenTester} from "../mocks/StakedTokenTester.sol";
+import {
+    Initializable,
+    StakedToken,
+    IStakedToken,
+    PausableUpgradeable,
+    ERC4626Upgradeable,
+    ERC20PermitUpgradeable
+} from "../../src/StakedToken.sol";
+import {MockERC20} from "../mocks/MockERC20.sol";
+import {IRewardsController} from "aave-v3-periphery/contracts/rewards/interfaces/IRewardsController.sol";
+import {ERC1967Proxy, ERC1967Utils} from "openzeppelin-contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {Math} from "openzeppelin-contracts/utils/math/Math.sol";
+import {IVotes} from "openzeppelin-contracts/governance/utils/IVotes.sol";
+import {IAccessControl} from "openzeppelin-contracts/access/IAccessControl.sol";
+import {RewardsController} from "aave-v3-periphery/contracts/rewards/RewardsController.sol";
+import {InitializableAdminUpgradeabilityProxy} from
+    "aave-v3-core/contracts/dependencies/openzeppelin/upgradeability/InitializableAdminUpgradeabilityProxy.sol";
+import {RewardsControllerUtils} from "../utils/RewardsControllerUtils.sol";
 
 contract StakedTokenTest is Test {
-    StakedToken internal stakedToken;
-    StakedTokenTester internal testToken;
-    ERC20Mock underlyingAsset;
+    StakedToken public stkToken;
+    MockERC20 public asset;
+    address public admin;
+    address public user;
+    RewardsController public rewardsController;
 
-    ERC20Mock internal mockToken1;
-    ERC20Mock internal mockToken2;
-
-    MockPool internal mockPool;
-    MockOracle internal oracle;
-    MockFactory internal factory;
-    RewardsController internal rewardsController;
-    RewardKeeper internal rewardKeeper;
-
-    // Test addresses
-    address internal admin = address(0xA11CE);
-    address internal manager = address(0xBEEF);
-    address internal pauser = address(0xDEAD);
-    address internal user = address(0xCAFE);
-    address internal treasury = address(0xEAAE);
-
-    // Roles
-    bytes32 constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
-    bytes32 constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
-    bytes32 constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
-
-    // Cooldown/Unstake config
-    uint256 internal defaultCooldown = 3 days;
-    uint256 internal defaultUnstakeWindow = 2 days;
-    address a1;
+    uint256 constant COOLDOWN_SECONDS = 7 days;
+    uint256 constant UNSTAKE_WINDOW = 1 days;
 
     function setUp() public {
-        mockToken1 = new ERC20Mock();
-        mockToken2 = new ERC20Mock();
-        mockToken1.mint(address(this), 1_000_000 ether);
-        mockToken2.mint(address(this), 2_000_000 ether);
+        // Setup accounts
+        admin = makeAddr("admin");
+        user = makeAddr("user");
 
-        underlyingAsset = new ERC20Mock();
+        // Deploy mock token
+        asset = new MockERC20("SEAM Token", "SEAM", 18);
 
-        oracle = new MockOracle();
-
-        // Deploy the StakedToken (UUPS proxy-like) directly for testing
+        // Deploy StakedToken through proxy
         StakedToken implementation = new StakedToken();
         ERC1967Proxy proxy = new ERC1967Proxy(
             address(implementation),
             abi.encodeWithSelector(
-                implementation.initialize.selector,
-                address(underlyingAsset),
+                StakedToken.initialize.selector,
+                address(asset),
                 admin,
-                "StakedToken",
-                "STK",
-                defaultCooldown,
-                defaultUnstakeWindow
+                "Staked SEAM",
+                "stkSEAM",
+                COOLDOWN_SECONDS,
+                UNSTAKE_WINDOW
             )
         );
-        stakedToken = StakedToken(address(proxy));
+        stkToken = StakedToken(address(proxy));
 
-        address[] memory reserves = new address[](2);
-        reserves[0] = address(mockToken1);
-        reserves[1] = address(mockToken2);
-        mockPool = new MockPool(reserves, treasury);
+        // Deploy RewardsController through proxy
+        rewardsController = RewardsControllerUtils.deployRewardsController(address(stkToken), admin);
 
-        a1 = mockPool.setReserveData(address(mockToken1), address(mockToken1));
-        address a2 = mockPool.setReserveData(address(mockToken2), address(mockToken2));
-        address[] memory aTokens = new address[](2);
-        aTokens[0] = a1;
-        aTokens[1] = a2;
-        factory = new MockFactory();
-        factory.createStaticATokens(reserves, aTokens);
-
-        RewardKeeper implementation2 = new RewardKeeper();
-        proxy = new ERC1967Proxy(
-            address(implementation2),
-            abi.encodeWithSelector(
-                implementation2.initialize.selector,
-                address(mockPool),
-                admin,
-                address(stakedToken),
-                address(oracle),
-                treasury,
-                address(factory)
-            )
-        );
-        rewardKeeper = RewardKeeper(address(proxy));
-
-        rewardsController = new RewardsController(address(rewardKeeper));
-
-        vm.startPrank(treasury);
-        IERC20(a1).approve(address(rewardKeeper), 10000000000 ether);
-        IERC20(a2).approve(address(rewardKeeper), 10000000000 ether);
-        vm.stopPrank();
-
-        // Grant roles to manager and pauser
+        // Setup roles and controllers
         vm.startPrank(admin);
-        rewardKeeper.setRewardsController(address(rewardsController));
-        stakedToken.setController(address(rewardsController));
-        stakedToken.grantRole(MANAGER_ROLE, manager);
-        stakedToken.grantRole(PAUSER_ROLE, pauser);
-        stakedToken.grantRole(UPGRADER_ROLE, admin); // So admin can upgrade in tests
-        stakedToken.setController(address(rewardsController));
+        stkToken.setController(address(rewardsController));
         vm.stopPrank();
 
-        // Mint some tokens to user for testing
-        underlyingAsset.mint(user, 10_000 ether);
-        // Approve the StakedToken to spend user's tokens
-        vm.prank(user);
-        underlyingAsset.approve(address(stakedToken), type(uint256).max);
-
-        vm.prank(address(rewardKeeper));
-        IERC20(a1).approve(factory.getStaticAToken(address(mockToken1)), 1000000000 ether);
+        // By default block.timestamp is 0, warp to after cooldown period and unstake window to prevent underflows.
+        vm.warp(block.timestamp + COOLDOWN_SECONDS + UNSTAKE_WINDOW);
     }
 
-    function _upgradeAndSetTestValues() internal {
-        // 1) Upgrade from originalImplementation -> testImplementation
-        StakedTokenTester testImp = new StakedTokenTester();
+    // ============ Initialization Tests ============
+
+    function test_Initialize() public {
+        assertEq(stkToken.name(), "Staked SEAM");
+        assertEq(stkToken.symbol(), "stkSEAM");
+        assertEq(stkToken.decimals(), 18);
+        assertEq(stkToken.asset(), address(asset));
+        assertEq(stkToken.getCooldown(), COOLDOWN_SECONDS);
+        assertEq(stkToken.getUnstakeWindow(), UNSTAKE_WINDOW);
+
+        assertTrue(stkToken.hasRole(stkToken.DEFAULT_ADMIN_ROLE(), admin));
+        assertTrue(stkToken.hasRole(stkToken.MANAGER_ROLE(), admin));
+        assertTrue(stkToken.hasRole(stkToken.UPGRADER_ROLE(), admin));
+        assertTrue(stkToken.hasRole(stkToken.PAUSER_ROLE(), admin));
+    }
+
+    function test_ImplementationInitializersDisabled() public {
+        // Deploy a new implementation without proxy
+        StakedToken implementation = new StakedToken();
+
+        // Try to initialize the implementation directly
+        vm.expectRevert(Initializable.InvalidInitialization.selector);
+        implementation.initialize(address(asset), admin, "Staked SEAM", "stkSEAM", COOLDOWN_SECONDS, UNSTAKE_WINDOW);
+    }
+
+    // ============ Upgrade Tests ============
+
+    function test_Upgrade() public {
+        // Deploy new implementation
+        StakedToken newImplementation = new StakedToken();
+
+        // Expect the Upgraded event to be emitted
+        vm.expectEmit(true, true, true, true);
+        emit ERC1967Utils.Upgraded(address(newImplementation));
+
+        // Upgrade
         vm.prank(admin);
-        stakedToken.upgradeToAndCall(address(testImp), "");
-
-        // 2) Now cast the proxy to our testable interface
-        testToken = StakedTokenTester(address(stakedToken));
+        stkToken.upgradeToAndCall(address(newImplementation), "");
     }
 
-    function testInitialization() public {
-        // Basic check that initialization was correct
-        assertEq(stakedToken.asset(), address(underlyingAsset), "Incorrect underlying asset");
-        assertEq(
-            address(stakedToken.getRewardsController()), address(rewardsController), "Incorrect rewards controller"
+    function test_RevertWhen_NonUpgraderUpgrades() public {
+        StakedToken newImplementation = new StakedToken();
+
+        vm.startPrank(user);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, user, stkToken.UPGRADER_ROLE()
+            )
         );
-        assertEq(stakedToken.getCooldown(), defaultCooldown, "Incorrect default cooldown");
-        assertEq(stakedToken.getUnstakeWindow(), defaultUnstakeWindow, "Incorrect default unstake window");
+        stkToken.upgradeToAndCall(address(newImplementation), "");
 
-        // Check roles
-        assertTrue(stakedToken.hasRole(stakedToken.DEFAULT_ADMIN_ROLE(), admin), "Admin not set");
-        assertTrue(stakedToken.hasRole(MANAGER_ROLE, manager), "Manager not set");
-        assertTrue(stakedToken.hasRole(PAUSER_ROLE, pauser), "Pauser not set");
+        vm.stopPrank();
     }
 
-    function testDepositAndWithdraw() public {
-        // Deposit
-        vm.warp(block.timestamp + 500 days);
-        vm.prank(user);
-        uint256 sharesMinted = stakedToken.deposit(1000 ether, user);
-        assertEq(sharesMinted, 1000 ether, "Shares minted should match deposit amount");
-        assertEq(stakedToken.balanceOf(user), 1000 ether, "User's Staked balance mismatch");
+    // ============ Scaled Balance Tests ============
 
-        // Without cooldown, withdrawal should revert
-        vm.prank(user);
-        vm.expectRevert(IStakedToken.CooldownNotInitiated.selector);
-        stakedToken.withdraw(1000 ether, user, user);
+    function testFuzz_ScaledTotalSupply(uint256 amount) public {
+        // Bound the amount to avoid overflow and unrealistic values
+        amount = bound(amount, 1, 1e36);
+
+        vm.startPrank(user);
+
+        // Mint enough tokens to the user
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.mint(amount, user);
+
+        assertEq(stkToken.scaledTotalSupply(), stkToken.totalSupply());
+
+        vm.stopPrank();
+    }
+
+    function testFuzz_GetScaledUserBalanceAndSupply(uint256 amount) public {
+        // Bound the amount to avoid overflow and unrealistic values
+        amount = bound(amount, 1, 1e36);
+
+        vm.startPrank(user);
+
+        // Mint enough tokens to the user
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.mint(amount, user);
+
+        (uint256 scaledBalance, uint256 scaledSupply) = stkToken.getScaledUserBalanceAndSupply(user);
+        assertEq(scaledBalance, stkToken.balanceOf(user));
+        assertEq(scaledSupply, stkToken.totalSupply());
+
+        vm.stopPrank();
+    }
+
+    // ============ Pause/Unpause Tests ============
+
+    function test_Pause() public {
+        vm.startPrank(admin);
+
+        assertFalse(stkToken.paused());
+
+        stkToken.pause();
+        assertTrue(stkToken.paused());
+
+        vm.stopPrank();
+    }
+
+    function test_Unpause() public {
+        vm.startPrank(admin);
+
+        stkToken.pause();
+        assertTrue(stkToken.paused());
+
+        stkToken.unpause();
+        assertFalse(stkToken.paused());
+
+        vm.stopPrank();
+    }
+
+    function test_RevertWhen_NonPauserPauses() public {
+        vm.startPrank(user);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, user, stkToken.PAUSER_ROLE()
+            )
+        );
+        stkToken.pause();
+        vm.stopPrank();
+    }
+
+    function test_RevertWhen_NonPauserUnpauses() public {
+        vm.prank(admin);
+        stkToken.pause();
+
+        vm.startPrank(user);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, user, stkToken.PAUSER_ROLE()
+            )
+        );
+        stkToken.unpause();
+        vm.stopPrank();
+    }
+
+    // ============ Emergency Withdrawal Tests ============
+
+    function testFuzz_EmergencyWithdrawal(uint256 amount) public {
+        // Bound the amount to avoid overflow and unrealistic values
+        amount = bound(amount, 1, stkToken.maxMint(address(0)));
+
+        vm.startPrank(user);
+
+        // First deposit
+        asset.mint(user, amount); // Ensure user has enough tokens
+        asset.approve(address(stkToken), amount);
+        stkToken.deposit(amount, user);
+        vm.stopPrank();
+
+        // Emergency withdrawal
+        address emergencyRecipient = makeAddr("emergencyRecipient");
+        vm.startPrank(admin);
+
+        vm.expectEmit(true, true, true, true);
+        emit IStakedToken.EmergencyWithdraw(emergencyRecipient, amount);
+        stkToken.emergencyWithdrawal(emergencyRecipient, amount);
+
+        assertEq(asset.balanceOf(emergencyRecipient), amount);
+        assertEq(asset.balanceOf(address(stkToken)), 0);
+
+        vm.stopPrank();
+    }
+
+    function test_RevertWhen_NonManagerCallsEmergencyWithdrawal() public {
+        vm.startPrank(user);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, user, stkToken.MANAGER_ROLE()
+            )
+        );
+        stkToken.emergencyWithdrawal(user, 100e18);
+        vm.stopPrank();
+    }
+
+    // ============ Clock Tests ============
+
+    function test_Clock() public {
+        assertEq(stkToken.clock(), uint48(block.timestamp));
+    }
+
+    function test_ClockMode() public {
+        assertEq(stkToken.CLOCK_MODE(), "mode=timestamp");
+    }
+
+    // ============ Cooldown Tests ============
+
+    function test_Cooldown() public {
+        uint256 amount = 100e18;
+        vm.startPrank(user);
+
+        // First deposit
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.deposit(amount, user);
 
         // Initiate cooldown
-        vm.prank(user);
-        stakedToken.cooldown();
-        // Advance time forward to pass the cooldown + stay within unstake window
-        vm.warp(block.timestamp + defaultCooldown - 1);
+        vm.expectEmit(true, true, true, true);
+        emit IStakedToken.Cooldown(user);
+        stkToken.cooldown();
 
-        // Still in cooldown, now we can’t withdraw because it reverts if the block time hasn’t fully passed
-        vm.prank(user);
-        console.log(block.timestamp);
-        vm.expectRevert(IStakedToken.CooldownStillActive.selector);
-        stakedToken.withdraw(1000 ether, user, user);
+        assertEq(stkToken.getStakerCooldown(user), block.timestamp);
 
-        // Advance into the unstake window
-        vm.warp(block.timestamp + 2); // Now block.timestamp > cooldownEnd
-
-        vm.prank(user);
-        stakedToken.withdraw(1000 ether, user, user);
-        assertEq(stakedToken.balanceOf(user), 0, "Withdraw didn't burn shares");
-        assertEq(underlyingAsset.balanceOf(user), 10_000 ether, "User should get back underlying tokens");
+        vm.stopPrank();
     }
 
-    function test_getNextCooldownTimestamp_ReturnsZero_WhenToCooldownIsZero() public {
-        // toAddress has no cooldown => stakersCooldowns[toAddress] == 0
-        address toAddress = address(1);
-        // layout().stakersCooldowns[toAddress] = 0;
-
-        uint256 fromCooldown = 100;
-        uint256 amountToReceive = 50;
-        uint256 toBalance = 10;
-
-        uint256 result = stakedToken.getNextCooldownTimestamp(fromCooldown, amountToReceive, toAddress, toBalance);
-
-        assertEq(result, 0, "Should return zero when toCooldownTimestamp == 0");
+    function test_RevertWhen_CooldownWithZeroBalance() public {
+        vm.startPrank(user);
+        vm.expectRevert(abi.encodeWithSelector(IStakedToken.InsufficientStake.selector));
+        stkToken.cooldown();
+        vm.stopPrank();
     }
 
-    function test_getNextCooldownTimestamp_ReturnsZero_WhenToCooldownExpired() public {
-        address toAddress = address(2);
-        _upgradeAndSetTestValues();
-        // set some non-zero toCooldownTimestamp
-        testToken.setStakersCooldownForTest(toAddress, 100); // old timestamp
-        testToken.setCooldownSecondsForTest(10);
-        testToken.setUnstakeWindowForTest(5);
+    // ============ Get Next Cooldown Timestamp Tests ============
 
-        // Move time forward so that minimalValidCooldownTimestamp > 100
-        // minimalValidCooldownTimestamp = block.timestamp - 10 - 5
-        // We want that to be > 100 => block.timestamp = something greater than 115
-        vm.warp(200);
+    /// forge-config: default.fuzz.runs = 1
+    function testFuzz_GetNextCooldownTimestamp_WithZeroToCooldown(uint256 amount) public {
+        amount = bound(amount, 1, stkToken.maxMint(address(0)));
 
-        uint256 fromCooldown = 120;
-        uint256 amountToReceive = 50;
-        uint256 toBalance = 10;
+        address recipient = makeAddr("recipient");
 
-        uint256 result = stakedToken.getNextCooldownTimestamp(fromCooldown, amountToReceive, toAddress, toBalance);
+        vm.startPrank(user);
 
-        // Because 100 < (200 - 10 - 5) => toCooldownTimestamp = 0
-        assertEq(result, 0, "Should return zero when toCooldownTimestamp is expired");
+        // Setup initial state
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.mint(amount, user);
+        stkToken.cooldown();
+
+        uint256 fromCooldownTimestamp = stkToken.getStakerCooldown(user);
+
+        // Ensure recipient has no cooldown
+        assertEq(stkToken.getStakerCooldown(recipient), 0);
+
+        // Test getNextCooldownTimestamp with recipient having zero cooldown
+        uint256 cooldownTimestamp = stkToken.getNextCooldownTimestamp(fromCooldownTimestamp, amount, recipient, 0);
+
+        // When recipient has no cooldown, the function should return 0
+        assertEq(cooldownTimestamp, 0);
+
+        vm.stopPrank();
     }
 
-    function test_getNextCooldownTimestamp_ReturnsToCooldownTimestamp_WhenFromFinalLessThanTo() public {
-        address toAddress = address(3);
-        _upgradeAndSetTestValues();
-        // We want toCooldownTimestamp still valid, let's pick a stable block.timestamp
-        vm.warp(1000);
-        testToken.setStakersCooldownForTest(toAddress, 990); // Not expired => must be > (1000 - 10 - 5) = 985
-        testToken.setCooldownSecondsForTest(10);
-        testToken.setUnstakeWindowForTest(5);
+    /// forge-config: default.fuzz.runs = 1
+    function test_GetNextCooldownTimestamp_WithExpiredToCooldown(uint256 amount, uint256 recipientAmount) public {
+        amount = bound(amount, 1, stkToken.maxMint(address(0)) - 1);
+        recipientAmount = bound(recipientAmount, 1, stkToken.maxMint(address(0)) - amount);
 
-        // minimalValidCooldownTimestamp = 985
-        // fromCooldownTimestamp = 900 => that is < 985 => fromCooldownTimestampFinal = block.timestamp (1000)
-        // Then fromCooldownTimestampFinal = 1000
-        // Compare 1000 < toCooldownTimestamp(??) -> not less, so let's adjust
+        address recipient = makeAddr("recipient");
 
-        // Wait, we want fromCooldownTimestampFinal < 990. But fromCooldownTimestampFinal
-        // will become 1000 if 900 < 985. So let's make fromCooldownTimestamp = 987 so it *won't* become 1000
-        // Because 987 > 985 => fromCooldownTimestampFinal = 987 (not the block.timestamp).
-        // So finalFromCooldown = 987.
-        // Now finalFromCooldown(987) < toCooldownTimestamp(990) => we just return 990.
-
-        uint256 fromCooldown = 987; // > 985 => use fromCooldown directly
-        uint256 amountToReceive = 50;
-        uint256 toBalance = 100;
-
-        uint256 result = stakedToken.getNextCooldownTimestamp(fromCooldown, amountToReceive, toAddress, toBalance);
-
-        // We expect it to just return existing toCooldownTimestamp of 990
-        assertEq(result, 990, "Should return toCooldownTimestamp if fromCooldownTimestampFinal < toCooldown");
-    }
-
-    function test_getNextCooldownTimestamp_WeightedAverage() public {
-        address toAddress = address(4);
-        _upgradeAndSetTestValues();
-        // We'll set block.timestamp to 1000 again for stable reference
-        vm.warp(1000);
-
-        // Keep toCooldownTimestamp valid (say 990)
-        testToken.setStakersCooldownForTest(toAddress, 990);
-        testToken.setCooldownSecondsForTest(10);
-        testToken.setUnstakeWindowForTest(5);
-        // minimalValidCooldownTimestamp = 985
-
-        // We'll pick fromCooldown=987 => fromCooldownTimestampFinal=987
-        // Then if finalFromCooldown(987) >= toCooldownTimestamp(990)? => actually 987 < 990,
-        // that wouldn't trigger the weighted average. We need it >= 990.
-        // So let's make fromCooldown=995 => fromCooldownTimestampFinal=995.
-
-        uint256 fromCooldown = 995;
-        uint256 amountToReceive = 50;
-        uint256 toBalance = 100;
-
-        // fromCooldownTimestampFinal=995 >= toCooldownTimestamp(990),
-        // Weighted average => newTimestamp = (50*995 + 100*990) / (50 + 100)
-        // = (49750 + 99000) / 150
-        // = 148750 / 150
-        // = 991.666..., trunc in solidity => 991
-
-        uint256 result = stakedToken.getNextCooldownTimestamp(fromCooldown, amountToReceive, toAddress, toBalance);
-        assertEq(result, 991, "Should return weighted average for fromCooldownTimestampFinal >= toCooldownTimestamp");
-    }
-
-    function test_getNextCooldownTimestamp_WeightedAverage_FromExpired() public {
-        address toAddress = address(5);
-        _upgradeAndSetTestValues();
-
-        // Set block.timestamp
-        vm.warp(1000);
-        testToken.setStakersCooldownForTest(toAddress, 990);
-        testToken.setCooldownSecondsForTest(10);
-        testToken.setUnstakeWindowForTest(5);
-        // minimalValidCooldownTimestamp = 985
-
-        uint256 cd = stakedToken.getStakerCooldown(toAddress);
-        assertEq(cd, 990);
-
-        // fromCooldown=900 => it's < 985 => fromCooldownTimestampFinal = block.timestamp(1000)
-        // Then 1000 >= 990 => Weighted average => (amountToReceive*1000 + toBalance*990) / (sum)
-        // Let amountToReceive=10, toBalance=5 => (10*1000 + 5*990) / (15) => (10000 + 4950) / 15 = 14950 / 15 = 996
-        // Actually 996.666..., integer trunc => 996
-        uint256 fromCooldown = 900;
-        uint256 amountToReceive = 10;
-        uint256 toBalance = 5;
-
-        uint256 result = stakedToken.getNextCooldownTimestamp(fromCooldown, amountToReceive, toAddress, toBalance);
-        assertEq(result, 996, "Should return integer-truncated weighted average using block.timestamp");
-    }
-
-    function testTransferCooldownLogicSimple() public {
-        // user deposits
-        vm.prank(user);
-        stakedToken.deposit(1000 ether, user);
-
-        // user starts cooldown
-        vm.prank(user);
-        stakedToken.cooldown();
-
-        assertEq(stakedToken.getStakerCooldown(user), block.timestamp, "Sender's cooldown is not set");
-
-        // If user transfers all shares to a fresh address, user cooldown is reset to 0
-        address recipient = address(0xBABE);
-
-        vm.expectCall(
-            address(rewardsController),
-            abi.encodeWithSelector(
-                rewardsController.handleAction.selector, user, stakedToken.totalSupply(), stakedToken.balanceOf(user)
-            )
-        );
-        vm.expectCall(
-            address(rewardsController),
-            abi.encodeWithSelector(
-                rewardsController.handleAction.selector,
-                recipient,
-                stakedToken.totalSupply(),
-                stakedToken.balanceOf(recipient)
-            )
-        );
-
-        vm.prank(user);
-        stakedToken.transfer(recipient, 1000 ether);
-
-        // user cooldown should be reset to 0
-        assertEq(stakedToken.getStakerCooldown(user), 0, "Sender's cooldown not cleared after transfer");
-        // recipient's cooldown should stay zero
-        assertEq(stakedToken.getStakerCooldown(recipient), 0, "Recipient's cooldown not set");
-    }
-
-    function testTransferCooldownLogicTimestampsChange() public {
-        vm.warp(block.timestamp + 500 days);
-        address recipient = address(0xBABE);
-        vm.prank(user);
-
-        underlyingAsset.transfer(recipient, 300 ether);
-        // user deposits
-        vm.prank(user);
-        stakedToken.deposit(700 ether, user);
-
-        // user starts cooldown
-        vm.prank(user);
-        stakedToken.cooldown();
-
-        assertEq(stakedToken.getStakerCooldown(user), block.timestamp, "Sender's cooldown is not set");
-
-        vm.warp(block.timestamp + 12 hours);
-
-        vm.startPrank(recipient);
-        underlyingAsset.approve(address(stakedToken), 300 ether);
-        stakedToken.deposit(300 ether, recipient);
-        stakedToken.cooldown();
+        // Setup initial state for both user and recipient
+        vm.startPrank(user);
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.mint(amount, user);
+        stkToken.cooldown();
+        uint256 fromCooldownTimestamp = stkToken.getStakerCooldown(user);
         vm.stopPrank();
 
-        vm.warp(block.timestamp + 16 hours);
+        // Setup recipient with a cooldown
+        vm.startPrank(recipient);
+        asset.mint(recipient, recipientAmount);
+        asset.approve(address(stkToken), recipientAmount);
+        stkToken.mint(recipientAmount, recipient);
+        stkToken.cooldown();
+        uint256 recipientCooldownTimestamp = stkToken.getStakerCooldown(recipient);
+        assertEq(recipientCooldownTimestamp, block.timestamp);
+        vm.stopPrank();
 
-        vm.expectCall(
-            address(rewardsController),
-            abi.encodeWithSelector(
-                rewardsController.handleAction.selector, user, stakedToken.totalSupply(), stakedToken.balanceOf(user)
-            )
-        );
-        vm.expectCall(
-            address(rewardsController),
-            abi.encodeWithSelector(
-                rewardsController.handleAction.selector,
-                recipient,
-                stakedToken.totalSupply(),
-                stakedToken.balanceOf(recipient)
-            )
-        );
+        // Warp time to make recipient's cooldown expired (past cooldown + unstake window)
+        vm.warp(block.timestamp + COOLDOWN_SECONDS + UNSTAKE_WINDOW + 1);
 
-        vm.prank(user);
-        stakedToken.transfer(recipient, 700 ether);
+        // Test getNextCooldownTimestamp with recipient having expired cooldown
+        uint256 cooldownTimestamp =
+            stkToken.getNextCooldownTimestamp(fromCooldownTimestamp, amount, recipient, stkToken.balanceOf(recipient));
 
-        // user cooldown should be reset to 0
-        assertEq(stakedToken.getStakerCooldown(user), 0, "Sender's cooldown not cleared after transfer");
-        // recipient's cooldown should be > 0
-        assertTrue(stakedToken.getStakerCooldown(recipient) > 0, "Recipient's cooldown not set");
+        // When recipient's cooldown is expired, the function should return 0
+        assertEq(cooldownTimestamp, 0);
     }
 
-    function testPauseAndEmergencyWithdraw() public {
-        // deposit some tokens
-        vm.prank(user);
-        stakedToken.deposit(1000 ether, user);
+    /// forge-config: default.fuzz.runs = 1
+    function test_GetNextCooldownTimestamp_FromCooldownLessThanToCooldown(
+        uint256 amount,
+        uint256 recipientAmount,
+        uint32 warpAmount
+    ) public {
+        amount = bound(amount, 1, stkToken.maxMint(address(0)) - 1);
+        recipientAmount = bound(recipientAmount, 1, stkToken.maxMint(address(0)) - amount);
+        warpAmount = uint32(bound(warpAmount, 1, COOLDOWN_SECONDS + UNSTAKE_WINDOW));
+        address recipient = makeAddr("recipient");
 
-        vm.prank(manager);
-        stakedToken.emergencyWithdrawal(user, 1 ether);
+        // Setup initial state for user (this will be the "from" address)
+        vm.startPrank(user);
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.mint(amount, user);
+        stkToken.cooldown();
+        uint256 fromCooldownTimestamp = stkToken.getStakerCooldown(user);
+        vm.stopPrank();
 
-        // Only pauser can enable emergency
-        vm.prank(user);
-        vm.expectRevert(); // user does not have PAUSER_ROLE
-        stakedToken.pause();
+        // Warp time to make user's cooldown expired (past cooldown + unstake window)
+        vm.warp(block.timestamp + warpAmount);
 
-        // Pauser triggers emergency
-        vm.prank(pauser);
-        stakedToken.pause();
+        // Setup recipient with a fresh cooldown (this will be the "to" address)
+        // This ensures recipient's cooldown is not expired
+        vm.startPrank(recipient);
+        asset.mint(recipient, recipientAmount);
+        asset.approve(address(stkToken), recipientAmount);
+        stkToken.mint(recipientAmount, recipient);
+        stkToken.cooldown();
+        uint256 recipientCooldownTimestamp = stkToken.getStakerCooldown(recipient);
+        assertEq(recipientCooldownTimestamp, block.timestamp);
+        vm.stopPrank();
 
-        // Contract is paused, normal deposits/withdraws revert
-        vm.prank(user);
-        vm.expectRevert(abi.encodeWithSelector(PausableUpgradeable.EnforcedPause.selector));
-        stakedToken.deposit(1 ether, user);
+        // Verify recipient's cooldown is still valid
+        assertTrue(block.timestamp <= recipientCooldownTimestamp + COOLDOWN_SECONDS + UNSTAKE_WINDOW);
 
-        vm.prank(user);
-        vm.expectRevert(abi.encodeWithSelector(PausableUpgradeable.EnforcedPause.selector));
-        stakedToken.withdraw(1 ether, user, user);
+        // Test getNextCooldownTimestamp with:
+        // - fromCooldownTimestamp that is expired
+        // - recipient having a current, valid cooldown
+        uint256 cooldownTimestamp =
+            stkToken.getNextCooldownTimestamp(fromCooldownTimestamp, amount, recipient, stkToken.balanceOf(recipient));
 
-        // manager can do emergencyWithdrawal
-        uint256 balBefore = underlyingAsset.balanceOf(user);
-        vm.prank(manager);
-        stakedToken.emergencyWithdrawal(user, 500 ether);
-
-        // Check user received underlying
-
-        assertEq(
-            balBefore + 500 ether, underlyingAsset.balanceOf(user), "user not receiving correct emergency withdrawal"
-        );
-
-        // End emergency state
-        vm.prank(pauser);
-        stakedToken.unpause();
-
-        // normal deposit again
-        uint256 toAdd = stakedToken.previewDeposit(1 ether);
-        vm.prank(user);
-        stakedToken.deposit(1 ether, user);
-        assertEq(stakedToken.balanceOf(user), 1000 ether + toAdd, "Deposit after emergency ended failed");
+        // When from's cooldown is expired but recipient's is valid,
+        // the function should return the recipient's cooldown timestamp
+        assertEq(cooldownTimestamp, recipientCooldownTimestamp);
     }
 
-    function testChangeRewardsController() public {
-        address newController = address(0x9999);
+    function test_GetNextCooldownTimestamp_WeightedAverage(uint256 amount, uint256 recipientAmount) public {
+        amount = bound(amount, 1, stkToken.maxMint(address(0)) - 1);
+        recipientAmount = bound(recipientAmount, 1, stkToken.maxMint(address(0)) - amount);
 
-        // Only manager can change
-        vm.prank(user);
-        vm.expectRevert(); // user is not manager
-        stakedToken.setController(newController);
+        address recipient = makeAddr("recipient");
 
-        // Manager can set
-        vm.prank(manager);
-        stakedToken.setController(newController);
-        assertEq(address(stakedToken.getRewardsController()), newController, "Controller not updated");
+        // Setup initial state for user (this will be the "from" address)
+        vm.startPrank(user);
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.mint(amount, user);
+        stkToken.cooldown();
+        uint256 fromCooldownTimestamp = stkToken.getStakerCooldown(user);
+        vm.stopPrank();
 
-        // Zero address revert
-        vm.prank(manager);
-        vm.expectRevert(abi.encodeWithSelector(IStakedToken.ZeroAddress.selector));
-        stakedToken.setController(address(0));
-    }
+        // Setup recipient with an existing balance and cooldown
+        vm.startPrank(recipient);
+        asset.mint(recipient, recipientAmount);
+        asset.approve(address(stkToken), recipientAmount);
+        stkToken.mint(recipientAmount, recipient);
+        stkToken.cooldown();
+        uint256 recipientCooldownTimestamp = stkToken.getStakerCooldown(recipient);
+        vm.stopPrank();
 
-    function testChangeTimers() public {
-        uint256 newCooldown = 10 days;
-        uint256 newUnstakeWindow = 3 days;
+        // Warp time forward but still within valid cooldown window for both
+        vm.warp(block.timestamp + 1 days);
 
-        // Non-manager attempt
-        vm.prank(user);
-        vm.expectRevert(); // user not manager
-        stakedToken.setTimers(newCooldown, newUnstakeWindow);
+        // Calculate expected weighted average
+        uint256 expectedCooldownTimestamp =
+            (amount * fromCooldownTimestamp + recipientAmount * recipientCooldownTimestamp) / (amount + recipientAmount);
 
-        vm.prank(manager);
-        stakedToken.setTimers(newCooldown, newUnstakeWindow);
-        assertEq(stakedToken.getCooldown(), newCooldown, "Cooldown not updated");
-        assertEq(stakedToken.getUnstakeWindow(), newUnstakeWindow, "Unstake window not updated");
-    }
+        // Test getNextCooldownTimestamp with both valid cooldowns
+        uint256 actualCooldownTimestamp =
+            stkToken.getNextCooldownTimestamp(fromCooldownTimestamp, amount, recipient, stkToken.balanceOf(recipient));
 
-    function testUpgradeRequiresUpgraderRole() public {
-        StakedToken upgrade = new StakedToken();
-        vm.expectRevert();
-        stakedToken.upgradeToAndCall(address(upgrade), "");
+        // Verify the weighted average calculation
+        assertEq(actualCooldownTimestamp, expectedCooldownTimestamp);
 
-        vm.prank(admin);
-        stakedToken.upgradeToAndCall(address(upgrade), "");
-    }
-
-    function testCooldownAtZeroBal() public {
-        vm.prank(address(1));
-        vm.expectRevert(abi.encodeWithSelector(IStakedToken.InsufficientStake.selector));
-        stakedToken.cooldown();
-    }
-
-    function testCantWithdrawAfterUnstakeWindow() public {
-        vm.warp(block.timestamp + 5 days);
-
-        vm.prank(user);
-        stakedToken.deposit(1000 ether, user);
-
-        vm.prank(user);
-        stakedToken.cooldown();
-
-        vm.warp(block.timestamp + 20 days);
-
-        vm.prank(user);
-        vm.expectRevert(abi.encodeWithSelector(IStakedToken.UnstakeWindowExpired.selector));
-        stakedToken.withdraw(1000 ether, user, user);
-    }
-
-    function testNonces() public {
-        vm.prank(user);
-        uint256 n = stakedToken.nonces(user);
-        assertEq(n, 0);
-    }
-
-    function testHandleAction() public {
-        vm.warp(block.timestamp + 5 days);
-
-        rewardKeeper.claimAndSetRate();
-        address sa1 = factory.getStaticAToken(address(mockToken1));
-        address sa2 = factory.getStaticAToken(address(mockToken2));
-
-        address[] memory assets = new address[](1);
-        assets[0] = address(stakedToken);
-        uint256 indexBefore = rewardsController.getUserRewards(assets, user, sa1);
-        assertEq(indexBefore, 0);
-
-        vm.prank(user);
-        stakedToken.deposit(1000 ether, user);
-
-        vm.warp(block.timestamp + 10);
-        uint256 indexAfter = rewardsController.getUserRewards(assets, user, sa1);
-        assertTrue(indexAfter > 0);
-    }
-
-    function testHandleActionWhenFromIsNotZero() public {
-        vm.warp(block.timestamp + 5 days);
-        address user2 = address(2);
-
-        rewardKeeper.claimAndSetRate();
-        address sa1 = factory.getStaticAToken(address(mockToken1));
-        address sa2 = factory.getStaticAToken(address(mockToken2));
-
-        address[] memory assets = new address[](1);
-        assets[0] = address(stakedToken);
-        uint256 indexBefore = rewardsController.getUserRewards(assets, user, sa1);
-        uint256 indexBefore2 = rewardsController.getUserRewards(assets, user2, sa2);
-        assertEq(indexBefore, 0);
-        assertEq(indexBefore2, 0);
-
-        vm.prank(user);
-        stakedToken.deposit(1000 ether, user);
-
-        vm.prank(user);
-        stakedToken.transfer(user2, 500 ether);
-
-        vm.warp(block.timestamp + 10);
-        uint256 indexAfter = rewardsController.getUserRewards(assets, user, sa1);
-        assertTrue(indexAfter > 0);
-
-        uint256 indexAfter2 = rewardsController.getUserRewards(assets, user2, sa2);
-        assertTrue(indexAfter2 > 0);
-    }
-
-    function testHandleActionWhenFromIsNotZeroAndActiveCooldown() public {
-        vm.warp(block.timestamp + 5 days);
-        address user2 = address(2);
-
-        rewardKeeper.claimAndSetRate();
-
-        address[] memory assets = new address[](1);
-        assets[0] = address(stakedToken);
-
-        vm.prank(user);
-        stakedToken.deposit(1000 ether, user);
-
-        vm.prank(user);
-        stakedToken.cooldown();
-        vm.warp(block.timestamp + 10);
-
-        uint256 indexBefore = rewardsController.getUserRewards(assets, user, address(mockToken1));
-        uint256 indexBefore2 = rewardsController.getUserRewards(assets, user2, address(mockToken1));
-        assertEq(indexBefore2, 0);
-        vm.prank(user);
-        stakedToken.transfer(user2, 1000 ether);
-
-        uint256 indexAfter = rewardsController.getUserRewards(assets, user, address(mockToken1));
-        assertEq(indexAfter, indexBefore);
-
-        uint256 indexAfter2 = rewardsController.getUserRewards(assets, user2, address(mockToken1));
-        assertTrue(indexAfter2 == 0);
-    }
-
-    function testClaimManyUsersAndWithdraw() public {
-        uint256 userCount = 2;
-        vm.warp(block.timestamp + 5 days);
-        rewardKeeper.claimAndSetRate();
-        IERC20 token1 = IERC20(factory.getStaticAToken(address(mockToken1)));
-
-        address[] memory assets = new address[](1);
-        assets[0] = address(stakedToken);
-
-        for (uint256 k = 1; k <= userCount; k++) {
-            address player = address(uint160(k));
-            uint256 random = uint256(keccak256(abi.encodePacked(block.timestamp, block.prevrandao, msg.sender)));
-            random = ((random % 5000) + 1) * 1e18;
-            deal(address(underlyingAsset), player, random);
-            vm.startPrank(player);
-            underlyingAsset.approve(address(stakedToken), random);
-            stakedToken.deposit(random, player);
-            vm.stopPrank();
-            vm.warp(block.timestamp + 3);
-        }
-
-        vm.warp(block.timestamp + 2 hours);
-        (, uint256 rate,, uint256 endTime) = rewardsController.getRewardsData(address(stakedToken), address(token1));
-        uint256 expectedPeriod = rewardKeeper.getPreviousPeriod();
-        assertEq(1000 ether / expectedPeriod, rate, "wrong rate 0");
-        uint256 leftOver = 1000 ether - (rate * expectedPeriod);
-        uint256 transferBal0 = token1.balanceOf(rewardsController.getTransferStrategy(address(token1)));
-        assertEq(token1.balanceOf(address(rewardKeeper)), leftOver, "Wrong leftover 0");
-        assertEq(transferBal0, rate * expectedPeriod, "wrong bal 0");
-
-        vm.warp(block.timestamp + 26 hours);
-        rewardKeeper.claimAndSetRate();
-
-        (, rate,, endTime) = rewardsController.getRewardsData(address(stakedToken), address(token1));
-        expectedPeriod = rewardKeeper.getPreviousPeriod();
-        assertEq((1000 ether + leftOver) / expectedPeriod, rate, "wrong rate 1");
-        leftOver = (1000 ether + leftOver) - (rate * expectedPeriod);
-
-        assertEq(token1.balanceOf(address(rewardKeeper)), leftOver, "Wrong leftover 1");
-        assertEq(
-            token1.balanceOf(rewardsController.getTransferStrategy(address(token1))),
-            rate * expectedPeriod + transferBal0,
-            "wrong bal 1"
-        );
-
-        for (uint256 i = 1; i <= userCount; i++) {
-            address player = address(uint160(i));
-            vm.startPrank(player);
-            console.log(player, 1);
-            (, uint256[] memory claimedAmounts) = rewardsController.claimAllRewards(assets, player);
-            for (uint256 j; j < claimedAmounts.length; j++) {
-                assertTrue(claimedAmounts[j] > 0);
-            }
-            vm.stopPrank();
-        }
-        transferBal0 = token1.balanceOf(rewardsController.getTransferStrategy(address(token1)));
-        vm.warp(block.timestamp + 26 hours);
-        rewardKeeper.claimAndSetRate();
-        vm.warp(block.timestamp + 26 hours);
-
-        (, rate,, endTime) = rewardsController.getRewardsData(address(stakedToken), address(token1));
-        expectedPeriod = rewardKeeper.getPreviousPeriod();
-        uint256 oldLeftover = leftOver;
-        assertEq((1000 ether + leftOver) / expectedPeriod, rate, "wrong rate 2");
-        leftOver = (1000 ether + leftOver) - (rate * expectedPeriod);
-
-        assertEq(token1.balanceOf(address(rewardKeeper)), leftOver, "Wrong leftover 2");
-        assertEq(
-            token1.balanceOf(rewardsController.getTransferStrategy(address(token1))),
-            rate * expectedPeriod + transferBal0,
-            "wrong bal 2"
-        );
-
-        uint256 rewards1 = rewardsController.getUserRewards(assets, address(uint160(1)), address(token1));
-        uint256 rewards2 = rewardsController.getUserRewards(assets, address(uint160(2)), address(token1));
+        // Verify it's between the two original timestamps
         assertTrue(
-            token1.balanceOf(rewardsController.getTransferStrategy(address(token1))) >= rewards1 + rewards2,
-            "wrong total rewards"
+            actualCooldownTimestamp >= Math.min(fromCooldownTimestamp, recipientCooldownTimestamp)
+                && actualCooldownTimestamp <= Math.max(fromCooldownTimestamp, recipientCooldownTimestamp)
+        );
+    }
+
+    // ============ Deposit/Mint/Stake Tests ============
+
+    function test_Mint(uint256 amount) public {
+        amount = bound(amount, 1, stkToken.maxMint(address(0)));
+        vm.startPrank(user);
+
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        uint256 shares = stkToken.mint(amount, user);
+
+        assertEq(shares, amount);
+        assertEq(stkToken.balanceOf(user), amount);
+        assertEq(asset.balanceOf(address(stkToken)), amount);
+
+        vm.stopPrank();
+    }
+
+    /// forge-config: default.fuzz.runs = 1
+    function test_RevertWhen_MintingWhilePaused(uint256 amount) public {
+        amount = bound(amount, 1, stkToken.maxMint(address(0)));
+        vm.prank(admin);
+        stkToken.pause();
+
+        vm.startPrank(user);
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+
+        vm.expectRevert(abi.encodeWithSelector(PausableUpgradeable.EnforcedPause.selector));
+        stkToken.mint(amount, user);
+
+        vm.stopPrank();
+    }
+
+    function test_MintWithActiveCooldown(uint256 amount, uint256 additionalAmount) public {
+        amount = bound(amount, 1, stkToken.maxMint(address(0)) - 1);
+        additionalAmount = bound(additionalAmount, 1, stkToken.maxMint(address(0)) - amount);
+
+        address recipient = makeAddr("recipient");
+
+        // Setup recipient with an existing balance and cooldown
+        vm.startPrank(recipient);
+        asset.mint(recipient, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.mint(amount, recipient);
+        stkToken.cooldown();
+        uint256 initialCooldownTimestamp = stkToken.getStakerCooldown(recipient);
+        vm.stopPrank();
+
+        // Mint additional tokens to recipient
+        vm.startPrank(user);
+        asset.mint(user, additionalAmount);
+        asset.approve(address(stkToken), additionalAmount);
+        stkToken.mint(additionalAmount, recipient);
+        vm.stopPrank();
+
+        // Verify cooldown timestamp is preserved
+        assertEq(stkToken.getStakerCooldown(recipient), initialCooldownTimestamp);
+        assertEq(stkToken.balanceOf(recipient), amount + additionalAmount);
+    }
+
+    function test_DepositWithActiveCooldown(uint256 amount, uint256 additionalAmount) public {
+        amount = bound(amount, 1, stkToken.maxDeposit(address(0)) - 1);
+        additionalAmount = bound(additionalAmount, 1, stkToken.maxDeposit(address(0)) - amount);
+
+        // Setup user with an existing balance and cooldown
+        vm.startPrank(user);
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.deposit(amount, user);
+        stkToken.cooldown();
+        uint256 initialCooldownTimestamp = stkToken.getStakerCooldown(user);
+        vm.stopPrank();
+
+        // Deposit additional tokens to user
+        vm.startPrank(user);
+        asset.mint(user, additionalAmount);
+        asset.approve(address(stkToken), additionalAmount);
+        stkToken.deposit(additionalAmount, user);
+        vm.stopPrank();
+
+        // Verify cooldown timestamp is preserved
+        assertEq(stkToken.getStakerCooldown(user), initialCooldownTimestamp);
+        assertEq(stkToken.balanceOf(user), amount + additionalAmount);
+    }
+
+    function test_Deposit(uint256 amount) public {
+        amount = bound(amount, 1, stkToken.maxDeposit(address(0)));
+        vm.startPrank(user);
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        uint256 shares = stkToken.deposit(amount, user);
+
+        assertEq(stkToken.balanceOf(user), amount);
+        assertEq(asset.balanceOf(address(stkToken)), amount);
+
+        vm.stopPrank();
+    }
+
+    /// forge-config: default.fuzz.runs = 1
+    function test_RevertWhen_DepositingWhilePaused(uint256 amount) public {
+        amount = bound(amount, 1, stkToken.maxDeposit(address(0)));
+        vm.prank(admin);
+        stkToken.pause();
+
+        vm.startPrank(user);
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+
+        vm.expectRevert(abi.encodeWithSelector(PausableUpgradeable.EnforcedPause.selector));
+        stkToken.deposit(amount, user);
+
+        vm.stopPrank();
+    }
+
+    // ============ Withdraw/Redeem/Unstake Tests ============
+
+    /// forge-config: default.fuzz.runs = 1
+    function testFuzz_Withdraw_AfterCooldown(uint256 amount) public {
+        amount = bound(amount, 1, stkToken.maxDeposit(address(0)));
+        vm.startPrank(user);
+
+        // First deposit
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.deposit(amount, user);
+
+        // Initiate cooldown
+        stkToken.cooldown();
+
+        // Warp to after cooldown period but within unstake window
+        vm.warp(block.timestamp + COOLDOWN_SECONDS + 1);
+
+        // Withdraw
+        uint256 assets = stkToken.withdraw(amount, user, user);
+
+        assertEq(assets, amount);
+        assertEq(stkToken.balanceOf(user), 0);
+        assertEq(asset.balanceOf(user), amount);
+        assertEq(asset.balanceOf(address(stkToken)), 0);
+
+        vm.stopPrank();
+    }
+
+    /// forge-config: default.fuzz.runs = 1
+    function testFuzz_RevertWhen_WithdrawBeforeCooldown(uint256 amount) public {
+        amount = bound(amount, 1, stkToken.maxDeposit(address(0)));
+        vm.startPrank(user);
+
+        // First deposit
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.deposit(amount, user);
+
+        // Initiate cooldown
+        stkToken.cooldown();
+
+        // Try to withdraw before cooldown period ends
+        vm.expectRevert(abi.encodeWithSelector(IStakedToken.CooldownStillActive.selector));
+        stkToken.withdraw(amount, user, user);
+
+        vm.stopPrank();
+    }
+
+    /// forge-config: default.fuzz.runs = 1
+    function testFuzz_RevertWhen_WithdrawAfterUnstakeWindow(uint256 amount) public {
+        amount = bound(amount, 1, stkToken.maxDeposit(address(0)));
+        vm.startPrank(user);
+
+        // First deposit
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.deposit(amount, user);
+
+        // Initiate cooldown
+        stkToken.cooldown();
+
+        // Warp to after unstake window
+        vm.warp(block.timestamp + COOLDOWN_SECONDS + UNSTAKE_WINDOW + 1);
+
+        // Try to withdraw after unstake window
+        vm.expectRevert(abi.encodeWithSelector(IStakedToken.UnstakeWindowExpired.selector));
+        stkToken.withdraw(amount, user, user);
+
+        vm.stopPrank();
+    }
+
+    /// forge-config: default.fuzz.runs = 1
+    function testFuzz_Redeem_AfterCooldown(uint256 amount) public {
+        amount = bound(amount, 1, stkToken.maxDeposit(address(0)));
+        vm.startPrank(user);
+
+        // First deposit
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.deposit(amount, user);
+
+        // Initiate cooldown
+        stkToken.cooldown();
+
+        // Warp to after cooldown period but within unstake window
+        vm.warp(block.timestamp + COOLDOWN_SECONDS + 1);
+
+        // Redeem
+        uint256 assets = stkToken.redeem(amount, user, user);
+
+        assertEq(assets, amount);
+        assertEq(stkToken.balanceOf(user), 0);
+        assertEq(asset.balanceOf(user), amount);
+        assertEq(asset.balanceOf(address(stkToken)), 0);
+
+        vm.stopPrank();
+    }
+
+    /// forge-config: default.fuzz.runs = 1
+    function testFuzz_RevertWhen_RedeemBeforeCooldown(uint256 amount) public {
+        amount = bound(amount, 1, stkToken.maxDeposit(address(0)));
+        vm.startPrank(user);
+
+        // First deposit
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.deposit(amount, user);
+
+        // Initiate cooldown
+        stkToken.cooldown();
+
+        // Try to redeem before cooldown period ends
+        vm.expectRevert(abi.encodeWithSelector(IStakedToken.CooldownStillActive.selector));
+        stkToken.redeem(amount, user, user);
+
+        vm.stopPrank();
+    }
+
+    /// forge-config: default.fuzz.runs = 1
+    function testFuzz_RevertWhen_RedeemAfterUnstakeWindow(uint256 amount) public {
+        amount = bound(amount, 1, stkToken.maxDeposit(address(0)));
+        vm.startPrank(user);
+
+        // First deposit
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.deposit(amount, user);
+
+        // Initiate cooldown
+        stkToken.cooldown();
+
+        // Warp to after unstake window
+        vm.warp(block.timestamp + COOLDOWN_SECONDS + UNSTAKE_WINDOW + 1);
+
+        // Try to redeem after unstake window
+        vm.expectRevert(abi.encodeWithSelector(IStakedToken.UnstakeWindowExpired.selector));
+        stkToken.redeem(amount, user, user);
+
+        vm.stopPrank();
+    }
+
+    function testFuzz_PartialWithdraw(uint256 amount, uint256 withdrawRatio) public {
+        amount = bound(amount, 2, stkToken.maxDeposit(address(0)));
+        withdrawRatio = bound(withdrawRatio, 1, 99);
+        uint256 withdrawAmount = (amount * withdrawRatio) / 100;
+
+        vm.startPrank(user);
+
+        // First deposit
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        assertEq(asset.balanceOf(user), amount, "Asset balance mismatch");
+        stkToken.deposit(amount, user);
+
+        // Initiate cooldown
+        stkToken.cooldown();
+
+        // Warp to after cooldown period but within unstake window
+        vm.warp(block.timestamp + COOLDOWN_SECONDS + 1);
+
+        // Partial withdraw
+        uint256 assets = stkToken.withdraw(withdrawAmount, user, user);
+
+        assertEq(assets, withdrawAmount);
+        assertEq(stkToken.balanceOf(user), amount - withdrawAmount);
+        assertEq(asset.balanceOf(user), withdrawAmount);
+        assertEq(asset.balanceOf(address(stkToken)), amount - withdrawAmount);
+
+        vm.stopPrank();
+    }
+
+    /// forge-config: default.fuzz.runs = 1
+    function testFuzz_WithdrawToOtherReceiver(uint256 amount) public {
+        amount = bound(amount, 1, stkToken.maxDeposit(address(0)));
+        address receiver = makeAddr("receiver");
+        vm.startPrank(user);
+
+        // First deposit
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.deposit(amount, user);
+
+        // Initiate cooldown
+        stkToken.cooldown();
+
+        // Warp to after cooldown period but within unstake window
+        vm.warp(block.timestamp + COOLDOWN_SECONDS + 1);
+
+        // Withdraw to different receiver
+        uint256 assets = stkToken.withdraw(amount, receiver, user);
+
+        assertEq(assets, amount);
+        assertEq(stkToken.balanceOf(user), 0);
+        assertEq(asset.balanceOf(user), 0);
+        assertEq(asset.balanceOf(receiver), amount);
+        assertEq(asset.balanceOf(address(stkToken)), 0);
+
+        vm.stopPrank();
+    }
+
+    // ============ Max Deposit/Supply Tests ============
+
+    function test_MaxDeposit() public {
+        // MaxDeposit should return the max supply
+        assertEq(stkToken.maxDeposit(address(0)), type(uint208).max);
+        assertEq(stkToken.maxDeposit(user), type(uint208).max);
+    }
+
+    function test_MaxMint() public {
+        // MaxMint should also return the max supply
+        assertEq(stkToken.maxMint(address(0)), type(uint208).max);
+        assertEq(stkToken.maxMint(user), type(uint208).max);
+    }
+
+    function test_RevertWhen_DepositExceedsMaxDeposit() public {
+        // Test deposit fails when exceeding max supply
+        uint256 amount = type(uint208).max;
+        amount += 1; // Exceed max supply by 1
+
+        vm.startPrank(user);
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+
+        // Should revert as we're exceeding the max supply
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ERC4626Upgradeable.ERC4626ExceededMaxDeposit.selector, user, amount, type(uint208).max
+            )
+        );
+        stkToken.deposit(amount, user);
+
+        vm.stopPrank();
+    }
+
+    // ============ ERC20Permit Tests ============
+
+    /// forge-config: default.fuzz.runs = 1
+    function test_Permit(uint256 amount) public {
+        // Bound amount to reasonable values, using maxMint as upper bound
+        amount = bound(amount, 1, stkToken.maxMint(address(0)));
+
+        // Generate random owner address with private key
+        (address owner, uint256 privateKey) = makeAddrAndKey("owner");
+        address spender = makeAddr("spender");
+
+        // Mint some tokens to the owner
+        vm.startPrank(admin);
+        asset.mint(owner, amount);
+        vm.stopPrank();
+
+        vm.startPrank(owner);
+        asset.approve(address(stkToken), amount);
+        stkToken.deposit(amount, owner);
+        vm.stopPrank();
+
+        // Check initial state
+        assertEq(stkToken.allowance(owner, spender), 0);
+        assertEq(stkToken.nonces(owner), 0);
+
+        // Create permit data
+        uint256 deadline = block.timestamp + 1 hours;
+
+        // Get domain separator
+        bytes32 DOMAIN_SEPARATOR = stkToken.DOMAIN_SEPARATOR();
+
+        // Create the permit digest
+        bytes32 structHash = keccak256(
+            abi.encode(
+                keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"),
+                owner,
+                spender,
+                amount,
+                stkToken.nonces(owner),
+                deadline
+            )
         );
 
-        for (uint256 i = 1; i <= userCount; i++) {
-            address player = address(uint160(i));
-            vm.startPrank(player);
-            console.log(player, 2);
-            (, uint256[] memory claimedAmounts) = rewardsController.claimAllRewards(assets, player);
-            for (uint256 j; j < claimedAmounts.length; j++) {
-                assertTrue(claimedAmounts[j] > 0, "Claim Amount Not greater than zero");
-            }
-            vm.warp(block.timestamp + 30);
-            console.log(player, 3);
-            (, claimedAmounts) = rewardsController.claimAllRewards(assets, player);
-            for (uint256 j; j < claimedAmounts.length; j++) {
-                assertTrue(claimedAmounts[j] == 0, "Claim Amount not zero");
-            }
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
 
-            vm.stopPrank();
-        }
+        // Sign the digest
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, digest);
 
-        (, rate,, endTime) = rewardsController.getRewardsData(address(stakedToken), address(token1));
-        expectedPeriod = rewardKeeper.getPreviousPeriod();
-        assertEq((1000 ether + oldLeftover) / expectedPeriod, rate, "wrong rate 3");
-        leftOver = (1000 ether + oldLeftover) - (rate * expectedPeriod);
+        // Execute permit
+        stkToken.permit(owner, spender, amount, deadline, v, r, s);
 
-        assertEq(token1.balanceOf(address(rewardKeeper)), leftOver, "Wrong leftover 3");
-        assertTrue(token1.balanceOf(rewardsController.getTransferStrategy(address(token1))) < 10, "wrong bal 3");
+        // Verify state after permit
+        assertEq(stkToken.allowance(owner, spender), amount);
+        assertEq(stkToken.nonces(owner), 1);
+    }
 
-        for (uint256 i = 1; i <= userCount; i++) {
-            address player = address(uint160(i));
-            rewardKeeper.claimAndSetRate();
-            vm.startPrank(player);
-            stakedToken.cooldown();
+    /// forge-config: default.fuzz.runs = 1
+    function test_RevertWhen_PermitExpired(uint256 amount) public {
+        // Bound amount to reasonable values, using maxMint as upper bound
+        amount = bound(amount, 1, stkToken.maxMint(address(0)));
 
-            vm.warp(block.timestamp + 3 days + 2);
-            console.log(player, 4);
-            stakedToken.redeem(stakedToken.balanceOf(player), player, player);
-            (, uint256[] memory claimedAmounts) = rewardsController.claimAllRewards(assets, player);
-            for (uint256 j; j < claimedAmounts.length; j++) {
-                assertTrue(claimedAmounts[j] > 0);
-            }
-            vm.warp(block.timestamp + 2 hours);
-            console.log(player, 5);
-            (, claimedAmounts) = rewardsController.claimAllRewards(assets, player);
-            for (uint256 j; j < claimedAmounts.length; j++) {
-                assertTrue(claimedAmounts[j] == 0);
-            }
-        }
+        // Generate random owner address with private key
+        (address owner, uint256 privateKey) = makeAddrAndKey("owner");
+        address spender = makeAddr("spender");
+
+        // Create permit data with expired deadline
+        uint256 deadline = block.timestamp - 1;
+
+        // Get domain separator
+        bytes32 DOMAIN_SEPARATOR = stkToken.DOMAIN_SEPARATOR();
+
+        // Create the permit digest
+        bytes32 structHash = keccak256(
+            abi.encode(
+                keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"),
+                owner,
+                spender,
+                amount,
+                stkToken.nonces(owner),
+                deadline
+            )
+        );
+
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+
+        // Sign the digest
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, digest);
+
+        // Execute permit - should revert due to expired deadline
+        vm.expectRevert(abi.encodeWithSelector(ERC20PermitUpgradeable.ERC2612ExpiredSignature.selector, deadline));
+        stkToken.permit(owner, spender, amount, deadline, v, r, s);
+    }
+
+    /// forge-config: default.fuzz.runs = 1
+    function test_RevertWhen_InvalidSignature(uint256 amount) public {
+        // Bound amount to reasonable values, using maxMint as upper bound
+        amount = bound(amount, 1, stkToken.maxMint(address(0)));
+
+        // Generate random owner address with private key
+        (address owner, uint256 privateKey) = makeAddrAndKey("owner");
+        address spender = makeAddr("spender");
+
+        // Generate a different key for invalid signature
+        (address differentSigner, uint256 differentPrivateKey) = makeAddrAndKey("attacker");
+
+        // Create permit data
+        uint256 deadline = block.timestamp + 1 hours;
+
+        // Create the permit digest
+        bytes32 structHash = keccak256(
+            abi.encode(
+                keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"),
+                owner,
+                spender,
+                amount,
+                stkToken.nonces(owner),
+                deadline
+            )
+        );
+
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", stkToken.DOMAIN_SEPARATOR(), structHash));
+
+        // Sign the digest with a different private key
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(differentPrivateKey, digest);
+
+        // Execute permit - should revert due to invalid signature
+        vm.expectRevert(
+            abi.encodeWithSelector(ERC20PermitUpgradeable.ERC2612InvalidSigner.selector, differentSigner, owner)
+        );
+        stkToken.permit(owner, spender, amount, deadline, v, r, s);
+    }
+
+    /// forge-config: default.fuzz.runs = 1
+    function test_Nonces(uint256 amount) public {
+        // Bound amount to reasonable values, using maxMint as upper bound
+        amount = bound(amount, 1, stkToken.maxMint(address(0)));
+
+        // Generate random owner address with private key
+        (address owner, uint256 privateKey) = makeAddrAndKey("owner");
+        address spender = makeAddr("spender");
+
+        // Mint some tokens to the owner
+        vm.startPrank(admin);
+        asset.mint(owner, amount);
+        vm.stopPrank();
+
+        vm.startPrank(owner);
+        asset.approve(address(stkToken), amount);
+        stkToken.deposit(amount, owner);
+        vm.stopPrank();
+
+        // Check initial nonce
+        assertEq(stkToken.nonces(owner), 0);
+
+        // Create permit data
+        uint256 deadline = block.timestamp + 1 hours;
+
+        // Get domain separator
+        bytes32 DOMAIN_SEPARATOR = stkToken.DOMAIN_SEPARATOR();
+
+        // Create the permit digest for nonce 0
+        bytes32 structHash = keccak256(
+            abi.encode(
+                keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"),
+                owner,
+                spender,
+                amount,
+                0, // nonce 0
+                deadline
+            )
+        );
+
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+
+        // Sign the digest
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, digest);
+
+        // Execute permit
+        stkToken.permit(owner, spender, amount, deadline, v, r, s);
+
+        // Verify nonce increased
+        assertEq(stkToken.nonces(owner), 1);
+
+        // Try to use the same signature again (should fail due to nonce mismatch)
+        vm.expectPartialRevert(ERC20PermitUpgradeable.ERC2612InvalidSigner.selector);
+        stkToken.permit(owner, spender, amount, deadline, v, r, s);
+
+        // Nonce should still be 1
+        assertEq(stkToken.nonces(owner), 1);
+    }
+
+    // ============ Admin Function Tests ============
+
+    /// forge-config: default.fuzz.runs = 1
+    function test_SetController(address newController) public {
+        vm.assume(newController != address(0));
+
+        vm.startPrank(admin);
+
+        vm.expectEmit();
+        emit IStakedToken.RewardsControllerSet(newController);
+        stkToken.setController(newController);
+
+        assertEq(address(stkToken.getRewardsController()), newController);
+
+        vm.stopPrank();
+    }
+
+    function test_RevertWhen_NonManagerSetsController() public {
+        vm.startPrank(user);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, user, stkToken.MANAGER_ROLE()
+            )
+        );
+        stkToken.setController(address(rewardsController));
+        vm.stopPrank();
+    }
+
+    /// forge-config: default.fuzz.runs = 1
+    function test_SetTimers(uint256 newCooldown, uint256 newUnstakeWindow) public {
+        vm.assume(newCooldown > 0 && newCooldown < 365 days);
+        vm.assume(newUnstakeWindow > 0 && newUnstakeWindow < 30 days);
+
+        vm.startPrank(admin);
+
+        vm.expectEmit();
+        emit IStakedToken.TimersSet(newCooldown, newUnstakeWindow);
+        stkToken.setTimers(newCooldown, newUnstakeWindow);
+
+        assertEq(stkToken.getCooldown(), newCooldown);
+        assertEq(stkToken.getUnstakeWindow(), newUnstakeWindow);
+
+        vm.stopPrank();
+    }
+
+    function test_RevertWhen_NonManagerSetsTimers() public {
+        vm.startPrank(user);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, user, stkToken.MANAGER_ROLE()
+            )
+        );
+        stkToken.setTimers(14 days, 2 days);
+        vm.stopPrank();
+    }
+
+    // ============ Voting Tests ============
+
+    function test_Delegate(uint256 amount) public {
+        // Bound amount to reasonable values, using maxMint as upper bound
+        amount = bound(amount, 1, stkToken.maxMint(address(0)));
+        address delegate = makeAddr("delegate");
+
+        vm.startPrank(user);
+
+        // First mint some tokens
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.mint(amount, user);
+
+        // Delegate voting power
+        vm.expectEmit(true, true, true, false);
+        emit IVotes.DelegateChanged(user, address(0), delegate);
+        stkToken.delegate(delegate);
+
+        assertEq(stkToken.delegates(user), delegate);
+        assertEq(stkToken.getVotes(delegate), amount);
+
+        vm.stopPrank();
+    }
+
+    function test_TransferWithDelegation(uint256 amount) public {
+        // Bound amount to reasonable values, using maxMint as upper bound
+        amount = bound(amount, 2, stkToken.maxMint(address(0)));
+        address recipient = makeAddr("recipient");
+
+        vm.startPrank(user);
+
+        // First mint and delegate
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.mint(amount, user);
+        stkToken.delegate(user);
+
+        // Transfer half the tokens
+        uint256 transferAmount = amount / 2;
+        stkToken.transfer(recipient, transferAmount);
+
+        assertEq(stkToken.getVotes(user), amount - transferAmount);
+        assertEq(stkToken.getVotes(recipient), 0);
+
+        vm.stopPrank();
+    }
+
+    // ============ Transfer Tests ============
+
+    function test_TransferWithCooldown() public {
+        uint256 amount = 100e18;
+        address recipient = makeAddr("recipient");
+
+        vm.startPrank(user);
+
+        // First mint and start cooldown
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.mint(amount, user);
+        stkToken.cooldown();
+
+        uint256 cooldownTimestamp = stkToken.getStakerCooldown(user);
+
+        // Transfer half the tokens
+        uint256 transferAmount = amount / 2;
+        stkToken.transfer(recipient, transferAmount);
+
+        // Check cooldown is maintained for remaining balance
+        assertEq(stkToken.getStakerCooldown(user), cooldownTimestamp);
+        assertEq(stkToken.getStakerCooldown(recipient), 0);
+
+        vm.stopPrank();
+    }
+
+    function test_TransferEntireBalanceResetsCooldown() public {
+        uint256 amount = 100e18;
+        address recipient = makeAddr("recipient");
+
+        vm.startPrank(user);
+
+        // First mint and start cooldown
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.mint(amount, user);
+        stkToken.cooldown();
+
+        // Transfer entire balance
+        stkToken.transfer(recipient, amount);
+
+        assertEq(stkToken.getStakerCooldown(user), 0);
+        assertEq(stkToken.getStakerCooldown(recipient), 0);
+
+        vm.stopPrank();
+    }
+
+    // ============ HandleAction Tests ============
+
+    function test_HandleActionOnDeposit(uint256 amount) public {
+        // Bound amount to reasonable values using maxDeposit
+        amount = bound(amount, 1e18, stkToken.maxDeposit(user));
+
+        vm.startPrank(user);
+
+        // Approve and prepare for deposit
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+
+        // Expect handleAction to be called with correct parameters
+        vm.expectCall(
+            address(rewardsController),
+            abi.encodeWithSelector(
+                IRewardsController.handleAction.selector,
+                user,
+                0, // totalSupply before deposit
+                0 // oldUserBalance
+            )
+        );
+
+        // Perform deposit
+        stkToken.deposit(amount, user);
+
+        vm.stopPrank();
+    }
+
+    /// forge-config: default.fuzz.runs = 10
+    function test_HandleActionOnTransfer(uint256 amount) public {
+        // Bound amount to reasonable values using maxDeposit
+        amount = bound(amount, 2e18, stkToken.maxDeposit(user));
+        address recipient = makeAddr("recipient");
+
+        // First mint some tokens to user
+        vm.startPrank(user);
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.deposit(amount, user);
+
+        uint256 transferAmount = amount / 2;
+        uint256 totalSupply = stkToken.totalSupply();
+
+        // Expect handleAction to be called for sender
+        vm.expectCall(
+            address(rewardsController),
+            abi.encodeWithSelector(
+                IRewardsController.handleAction.selector,
+                user,
+                totalSupply,
+                amount // oldUserBalance
+            )
+        );
+
+        // Expect handleAction to be called for recipient
+        vm.expectCall(
+            address(rewardsController),
+            abi.encodeWithSelector(
+                IRewardsController.handleAction.selector,
+                recipient,
+                totalSupply,
+                0 // oldUserBalance
+            )
+        );
+
+        // Perform transfer
+        stkToken.transfer(recipient, transferAmount);
+
+        vm.stopPrank();
+    }
+
+    /// forge-config: default.fuzz.runs = 10
+    function test_HandleActionOnRedeem(uint256 amount) public {
+        // Bound amount to reasonable values using maxDeposit
+        amount = bound(amount, 1e18, stkToken.maxDeposit(user));
+
+        // First mint some tokens to user
+        vm.startPrank(user);
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.deposit(amount, user);
+
+        // Start cooldown
+        stkToken.cooldown();
+
+        // Warp to after cooldown period but within unstake window
+        vm.warp(block.timestamp + COOLDOWN_SECONDS + 1);
+
+        uint256 totalSupply = stkToken.totalSupply();
+
+        // Expect handleAction to be called with correct parameters
+        vm.expectCall(
+            address(rewardsController),
+            abi.encodeWithSelector(
+                IRewardsController.handleAction.selector,
+                user,
+                totalSupply,
+                amount // oldUserBalance
+            )
+        );
+
+        // Perform redeem
+        stkToken.redeem(amount, user, user);
+
+        vm.stopPrank();
+    }
+
+    /// forge-config: default.fuzz.runs = 10
+    function test_HandleActionOnWithdraw(uint256 amount) public {
+        // Bound amount to reasonable values using maxDeposit
+        amount = bound(amount, 1e18, stkToken.maxDeposit(user));
+
+        // First mint some tokens to user
+        vm.startPrank(user);
+        asset.mint(user, amount);
+        asset.approve(address(stkToken), amount);
+        stkToken.deposit(amount, user);
+
+        // Start cooldown
+        stkToken.cooldown();
+
+        // Warp to after cooldown period but within unstake window
+        vm.warp(block.timestamp + COOLDOWN_SECONDS + 1);
+
+        uint256 totalSupply = stkToken.totalSupply();
+
+        // Expect handleAction to be called with correct parameters
+        vm.expectCall(
+            address(rewardsController),
+            abi.encodeWithSelector(
+                IRewardsController.handleAction.selector,
+                user,
+                totalSupply,
+                amount // oldUserBalance
+            )
+        );
+
+        // Perform withdraw
+        stkToken.withdraw(amount, user, user);
+
+        vm.stopPrank();
     }
 }

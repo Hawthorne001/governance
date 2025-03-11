@@ -8,32 +8,39 @@ import {ReentrancyGuardUpgradeable} from "openzeppelin-contracts-upgradeable/uti
 import {IERC20} from "openzeppelin-contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "openzeppelin-contracts/token/ERC20/utils/SafeERC20.sol";
 import {PausableUpgradeable} from "openzeppelin-contracts-upgradeable/utils/PausableUpgradeable.sol";
-import {IPool} from "@aave/core-v3/contracts/interfaces/IPool.sol";
-import {IRewardsController} from "@aave/periphery-v3/contracts/rewards/interfaces/IRewardsController.sol";
-import {ITransferStrategyBase} from "@aave/periphery-v3/contracts/rewards/interfaces/ITransferStrategyBase.sol";
-import {IEACAggregatorProxy} from "@aave/periphery-v3/contracts/misc/interfaces/IEACAggregatorProxy.sol";
-import {RewardsDataTypes} from "@aave/periphery-v3/contracts/rewards/libraries/RewardsDataTypes.sol";
-import {DataTypes} from "@aave/core-v3/contracts/protocol/libraries/types/DataTypes.sol";
-import {RewardKeeperStorage as Storage} from "../storage/RewardKeeperStorage.sol";
-import {IRewardKeeper} from "../interfaces/IRewardKeeper.sol";
-import {StaticATokenTransferStrategy} from "../transfer-strategies/StaticATokenTransferStrategy.sol";
-import {ERC20TransferStrategy} from "../transfer-strategies/ERC20TransferStrategy.sol";
-import {IStaticATokenFactory} from "static-a-token-v3/src/interfaces/IStaticATokenFactory.sol";
-import {StaticATokenLM} from "static-a-token-v3/src/StaticATokenLM.sol";
+import {IRewardsController} from "aave-v3-periphery/contracts/rewards/interfaces/IRewardsController.sol";
+import {ITransferStrategyBase} from "aave-v3-periphery/contracts/rewards/interfaces/ITransferStrategyBase.sol";
+import {IEACAggregatorProxy} from "aave-v3-periphery/contracts/misc/interfaces/IEACAggregatorProxy.sol";
+import {RewardsDataTypes} from "aave-v3-periphery/contracts/rewards/libraries/RewardsDataTypes.sol";
+import {FeeKeeperStorage} from "./storage/FeeKeeperStorage.sol";
+import {IFeeKeeper} from "./interfaces/IFeeKeeper.sol";
+import {ERC20TransferStrategy} from "./transfer-strategies/ERC20TransferStrategy.sol";
+import {IFeeSource} from "./interfaces/IFeeSource.sol";
+import {EnumerableSet} from "openzeppelin-contracts/utils/structs/EnumerableSet.sol";
 
-contract RewardKeeper is
+/**
+ * @title FeeKeeper
+ * @author Seamless Protocol
+ * @notice Contract that manages fee collection and distribution to stakers
+ * @dev This contract collects fees from various sources and distributes them as rewards
+ *      to stakers through the Rewards Controller. It supports multiple fee sources
+ *      and reward tokens, and allows for manual rate setting for authorized tokens.
+ *      The contract is upgradeable, access-controlled, and pausable.
+ */
+contract FeeKeeper is
+    IFeeKeeper,
     UUPSUpgradeable,
     AccessControlUpgradeable,
     PausableUpgradeable,
-    IRewardKeeper,
-    ReentrancyGuardUpgradeable
+    ReentrancyGuardUpgradeable,
+    FeeKeeperStorage
 {
-    using SafeERC20 for IERC20;
+    using EnumerableSet for EnumerableSet.AddressSet;
 
-    bytes32 constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
-    bytes32 constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
-    bytes32 constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
-    bytes32 constant REWARD_SETTER_ROLE = keccak256("REWARD_SETTER_ROLE");
+    bytes32 public constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant REWARD_SETTER_ROLE = keccak256("REWARD_SETTER_ROLE");
 
     modifier isNotZeroAddress(address target) {
         if (target == address(0)) {
@@ -48,136 +55,144 @@ contract RewardKeeper is
     }
 
     /// @notice Initializes the token storage and inherited contracts.
-    function initialize(
-        address pool,
-        address initialAdmin,
-        address stkSeam,
-        address oracle,
-        address treasury,
-        address staticATokenfactory
-    ) external initializer {
+    function initialize(address initialAdmin, address asset, address oracle) external initializer {
         __UUPSUpgradeable_init();
         __Pausable_init();
         __ReentrancyGuard_init();
-        Storage.Layout storage $ = Storage.layout();
+        StorageLayout storage $ = storageLayout();
 
-        $.pool = IPool(pool);
         $.oracle = IEACAggregatorProxy(oracle);
         $.period = 1 days;
         $.lastClaim = block.timestamp;
-        $.asset = stkSeam;
-        $.treasury = treasury;
-        $.staticATokenFactory = IStaticATokenFactory(staticATokenfactory);
+        $.asset = asset;
 
         _grantRole(DEFAULT_ADMIN_ROLE, initialAdmin);
         _grantRole(MANAGER_ROLE, initialAdmin);
+        _grantRole(REWARD_SETTER_ROLE, initialAdmin);
+        _grantRole(UPGRADER_ROLE, initialAdmin);
+        _grantRole(PAUSER_ROLE, initialAdmin);
     }
 
     /// @inheritdoc UUPSUpgradeable
     function _authorizeUpgrade(address) internal override onlyRole(UPGRADER_ROLE) {}
 
-    /// @inheritdoc IRewardKeeper
+    /// @inheritdoc IFeeKeeper
     function pause() external override onlyRole(PAUSER_ROLE) {
         _pause();
     }
 
-    /// @inheritdoc IRewardKeeper
+    /// @inheritdoc IFeeKeeper
     function unpause() external override onlyRole(PAUSER_ROLE) {
         _unpause();
     }
 
-    /// @inheritdoc IRewardKeeper
-    function claimLMRewards(address to, address asset, address[] calldata rewards)
-        external
-        override
-        isNotZeroAddress(to)
-        onlyRole(MANAGER_ROLE)
-    {
-        IRewardsController controller = getController();
-
-        address staticAToken = getStaticATokenFactory().getStaticAToken(asset);
-        StaticATokenTransferStrategy transferStrategy =
-            StaticATokenTransferStrategy(controller.getTransferStrategy(staticAToken));
-        if (address(transferStrategy) == address(0)) {
-            revert TransferStrategyNotSet();
-        }
-        transferStrategy.claimRewards(to, rewards);
-    }
-
-    /// @inheritdoc IRewardKeeper
+    /// @inheritdoc IFeeKeeper
     function claimAndSetRate() external override whenNotPaused nonReentrant {
         address asset = getAsset();
-        IPool pool = getPool();
         IRewardsController controller = getController();
         IEACAggregatorProxy oracle = getOracle();
-        address[] memory rewardTokens = pool.getReservesList();
         uint256 period = _validateAndUpdatePeriod();
 
-        // used for setting emissions
         uint88[] memory emissionRates = new uint88[](1);
-        address[] memory staticTokens = new address[](1);
+        address[] memory rewardTokens = new address[](1);
 
-        // claim rewards
-        pool.mintToTreasury(rewardTokens);
-        for (uint8 i; i < rewardTokens.length; i++) {
-            IERC20 token = IERC20(pool.getReserveData(rewardTokens[i]).aTokenAddress);
-            uint256 balance = token.balanceOf(getTreasury());
+        address[] memory feeSources = getFeeSources();
 
-            staticTokens[0] = getStaticATokenFactory().getStaticAToken(address(rewardTokens[i]));
-            address transferStrategy = controller.getTransferStrategy(staticTokens[0]);
+        for (uint256 i; i < feeSources.length; i++) {
+            IFeeSource feeSource = IFeeSource(feeSources[i]);
+            IERC20 token = feeSource.token();
 
-            if (staticTokens[0] == address(0) || balance == 0) {
+            // claim fees
+            feeSource.claim();
+
+            uint256 balance = token.balanceOf(address(this));
+
+            if (balance == 0) {
                 continue;
             }
 
-            emissionRates[0] = _processAToken(token, staticTokens[0], balance, period);
+            emissionRates[0] = uint88(balance / period);
 
             if (emissionRates[0] == 0) {
                 continue;
             }
 
+            address transferStrategy = controller.getTransferStrategy(address(token));
+
             if (transferStrategy == address(0)) {
-                transferStrategy = address(
-                    new StaticATokenTransferStrategy(IERC20(staticTokens[0]), address(controller), address(this))
-                );
+                transferStrategy = address(new ERC20TransferStrategy(token, address(controller), address(this)));
                 _configureAssets(
-                    staticTokens[0], transferStrategy, oracle, asset, controller, 0, uint32(block.timestamp)
+                    address(token),
+                    transferStrategy,
+                    oracle,
+                    asset,
+                    controller,
+                    emissionRates[0],
+                    uint32(block.timestamp + period)
                 );
+            } else {
+                rewardTokens[0] = address(token);
+                controller.setEmissionPerSecond(asset, rewardTokens, emissionRates);
+                controller.setDistributionEnd(asset, address(token), uint32(block.timestamp + period));
             }
 
-            controller.setEmissionPerSecond(asset, staticTokens, emissionRates);
-            controller.setDistributionEnd(asset, staticTokens[0], uint32(block.timestamp + period));
-            IERC20(staticTokens[0]).transfer(address(transferStrategy), emissionRates[0] * period);
-
-            emit SetRate(staticTokens, emissionRates);
-            emit SetDistributionEnd(staticTokens[0], uint32(block.timestamp + period));
+            SafeERC20.safeTransfer(IERC20(token), address(transferStrategy), emissionRates[0] * period);
         }
     }
 
-    /// @inheritdoc IRewardKeeper
+    /// @inheritdoc IFeeKeeper
+    function addFeeSource(IFeeSource feeSource)
+        external
+        override
+        onlyRole(MANAGER_ROLE)
+        isNotZeroAddress(address(feeSource))
+    {
+        _checkFeeSourceTokenIsUnique(feeSource);
+
+        storageLayout().feeSources.add(address(feeSource));
+
+        emit FeeSourceAdded(address(feeSource));
+    }
+
+    /// @inheritdoc IFeeKeeper
+    function removeFeeSource(IFeeSource feeSource)
+        external
+        override
+        onlyRole(MANAGER_ROLE)
+        isNotZeroAddress(address(feeSource))
+    {
+        storageLayout().feeSources.remove(address(feeSource));
+        emit FeeSourceRemoved(address(feeSource));
+    }
+
+    /// @inheritdoc IFeeKeeper
+    function getFeeSources() public view override returns (address[] memory feeSources) {
+        feeSources = storageLayout().feeSources.values();
+    }
+
+    /// @inheritdoc IFeeKeeper
     function setTokenForManualRate(address token, bool allowed)
         external
         override
         onlyRole(MANAGER_ROLE)
         isNotZeroAddress(token)
     {
-        Storage.layout().allowedManualTokens[token] = allowed;
+        storageLayout().allowedManualTokens[token] = allowed;
         emit AllowedManualTokenUpdated(token, allowed);
     }
 
-    /// @inheritdoc IRewardKeeper
+    /// @inheritdoc IFeeKeeper
     function setTransferStrategy(address rewardToken, address transferStrategy)
         external
         override
         onlyRole(REWARD_SETTER_ROLE)
         isNotZeroAddress(rewardToken)
     {
+        _checkIsManualRateAuthorized(rewardToken);
         getController().setTransferStrategy(rewardToken, ITransferStrategyBase(transferStrategy));
-
-        emit SetTransferStrategy(rewardToken, transferStrategy);
     }
 
-    /// @inheritdoc IRewardKeeper
+    /// @inheritdoc IFeeKeeper
     function configureAsset(
         address rewardToken,
         uint88 rate,
@@ -195,11 +210,9 @@ contract RewardKeeper is
             rate,
             distributionEnd
         );
-
-        emit ConfiguredAsset(rewardToken, rate, distributionEnd);
     }
 
-    /// @inheritdoc IRewardKeeper
+    /// @inheritdoc IFeeKeeper
     function setManualRate(address[] memory rewardTokens, uint88[] memory rates)
         external
         override
@@ -210,11 +223,9 @@ contract RewardKeeper is
             _checkIsManualRateAuthorized(rewardTokens[i]);
         }
         getController().setEmissionPerSecond(getAsset(), rewardTokens, rates);
-
-        emit SetRate(rewardTokens, rates);
     }
 
-    /// @inheritdoc IRewardKeeper
+    /// @inheritdoc IFeeKeeper
     function setManualDistributionEnd(address rewardToken, uint32 deadline)
         external
         override
@@ -222,10 +233,14 @@ contract RewardKeeper is
         isNotZeroAddress(rewardToken)
     {
         getController().setDistributionEnd(getAsset(), rewardToken, deadline);
-        emit SetDistributionEnd(rewardToken, deadline);
     }
 
-    /// @inheritdoc IRewardKeeper
+    /// @inheritdoc IFeeKeeper
+    function setClaimer(address user, address caller) external override onlyRole(MANAGER_ROLE) {
+        getController().setClaimer(user, caller);
+    }
+
+    /// @inheritdoc IFeeKeeper
     function emergencyWithdrawalFromTransferStrategy(address token, address to, uint256 amount)
         external
         override
@@ -238,33 +253,27 @@ contract RewardKeeper is
         ITransferStrategyBase(transferStrategy).emergencyWithdrawal(token, to, amount);
     }
 
-    /// @inheritdoc IRewardKeeper
+    /// @inheritdoc IFeeKeeper
     function withdrawTokens(address token, address to, uint256 amount) external override onlyRole(MANAGER_ROLE) {
-        IERC20(token).safeTransfer(to, amount);
+        SafeERC20.safeTransfer(IERC20(token), to, amount);
         emit WithdrawTokens(token, to, amount);
     }
 
-    /// @inheritdoc IRewardKeeper
+    /// @inheritdoc IFeeKeeper
     function setRewardsController(address controller)
         external
         override
         isNotZeroAddress(controller)
         onlyRole(MANAGER_ROLE)
     {
-        Storage.layout().controller = IRewardsController(controller);
+        storageLayout().controller = IRewardsController(controller);
         emit SetRewardsController(controller);
     }
 
-    /// @inheritdoc IRewardKeeper
-    function setPool(address newPool) external override isNotZeroAddress(newPool) onlyRole(MANAGER_ROLE) {
-        Storage.layout().pool = IPool(newPool);
-        emit SetPool(newPool);
-    }
-
-    /// @inheritdoc IRewardKeeper
+    /// @inheritdoc IFeeKeeper
     function setPeriod(uint256 newPeriod) external override onlyRole(MANAGER_ROLE) {
         if (newPeriod == 0) revert InvalidPeriod();
-        Storage.layout().period = newPeriod;
+        storageLayout().period = newPeriod;
         emit SetPeriod(newPeriod);
     }
 
@@ -276,26 +285,8 @@ contract RewardKeeper is
         if (getLastClaim() > block.timestamp - getPreviousPeriod()) revert InsufficientTimeElapsed();
         uint256 period = getPeriod();
         newPeriod = (((block.timestamp / period) + 1) * period) - block.timestamp;
-        Storage.layout().lastClaim = block.timestamp;
-        Storage.layout().previousPeriod = newPeriod;
-    }
-
-    /**
-     * @notice transfers aToken from treasury and then wraps into static token
-     * @dev also calculates and returns the rate
-     * @param aToken interface of the aToken
-     * @param staticToken the address of the static token
-     * @param balance the balance of aToken
-     * @param period the period for the current cycle
-     */
-    function _processAToken(IERC20 aToken, address staticToken, uint256 balance, uint256 period)
-        internal
-        returns (uint88 rate)
-    {
-        aToken.transferFrom(getTreasury(), address(this), balance);
-        aToken.approve(staticToken, aToken.balanceOf(address(this)));
-        StaticATokenLM(staticToken).deposit(aToken.balanceOf(address(this)), address(this), 0, false);
-        rate = uint88(IERC20(staticToken).balanceOf(address(this)) / period);
+        storageLayout().lastClaim = block.timestamp;
+        storageLayout().previousPeriod = newPeriod;
     }
 
     /**
@@ -338,53 +329,48 @@ contract RewardKeeper is
         }
     }
 
-    /// @inheritdoc IRewardKeeper
+    function _checkFeeSourceTokenIsUnique(IFeeSource feeSource) internal view {
+        address[] memory feeSources = getFeeSources();
+
+        for (uint256 i; i < feeSources.length; i++) {
+            if (address(IFeeSource(feeSources[i]).token()) == address(feeSource.token())) {
+                revert FeeSourceTokenAlreadyExists();
+            }
+        }
+    }
+
+    /// @inheritdoc IFeeKeeper
     function getController() public view override returns (IRewardsController rewardController) {
-        rewardController = Storage.layout().controller;
+        rewardController = storageLayout().controller;
     }
 
-    /// @inheritdoc IRewardKeeper
-    function getPool() public view override returns (IPool pool) {
-        pool = Storage.layout().pool;
-    }
-
-    /// @inheritdoc IRewardKeeper
+    /// @inheritdoc IFeeKeeper
     function getOracle() public view override returns (IEACAggregatorProxy oracle) {
-        oracle = Storage.layout().oracle;
+        oracle = storageLayout().oracle;
     }
 
-    /// @inheritdoc IRewardKeeper
-    function getStaticATokenFactory() public view returns (IStaticATokenFactory staticATokenFactory) {
-        staticATokenFactory = Storage.layout().staticATokenFactory;
-    }
-
-    /// @inheritdoc IRewardKeeper
+    /// @inheritdoc IFeeKeeper
     function getAsset() public view override returns (address asset) {
-        asset = Storage.layout().asset;
+        asset = storageLayout().asset;
     }
 
-    /// @inheritdoc IRewardKeeper
+    /// @inheritdoc IFeeKeeper
     function getPeriod() public view override returns (uint256 period) {
-        period = Storage.layout().period;
+        period = storageLayout().period;
     }
 
-    /// @inheritdoc IRewardKeeper
+    /// @inheritdoc IFeeKeeper
     function getPreviousPeriod() public view override returns (uint256 previousPeriod) {
-        previousPeriod = Storage.layout().previousPeriod;
+        previousPeriod = storageLayout().previousPeriod;
     }
 
-    /// @inheritdoc IRewardKeeper
+    /// @inheritdoc IFeeKeeper
     function getLastClaim() public view override returns (uint256 lastClaim) {
-        lastClaim = Storage.layout().lastClaim;
+        lastClaim = storageLayout().lastClaim;
     }
 
-    /// @inheritdoc IRewardKeeper
-    function getTreasury() public view override returns (address treasury) {
-        treasury = Storage.layout().treasury;
-    }
-
-    /// @inheritdoc IRewardKeeper
+    /// @inheritdoc IFeeKeeper
     function getIsAllowedForManualRate(address token) public view override returns (bool isAllowed) {
-        isAllowed = Storage.layout().allowedManualTokens[token];
+        isAllowed = storageLayout().allowedManualTokens[token];
     }
 }

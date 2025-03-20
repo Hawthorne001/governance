@@ -7,13 +7,13 @@ import {Seam} from "../../src/Seam.sol";
 import {Constants} from "../../src/library/Constants.sol";
 import {IMetaMorphoV1_1} from "../../src/interfaces/IMetaMorphoV1_1.sol";
 import {ERC20BalanceSplitterTwoPayee} from "../../src/ERC20BalanceSplitterTwoPayee.sol";
-import {SeamStakingScript} from "../../script/SeamStaking.s.sol";
+import {SeamStaking} from "../../script/SeamStaking.s.sol";
 import {FeeKeeper} from "../../src/FeeKeeper.sol";
 import {RewardsController} from "aave-v3-periphery/contracts/rewards/RewardsController.sol";
 import {StakedToken} from "../../src/StakedToken.sol";
 import {IERC20} from "openzeppelin-contracts/token/ERC20/IERC20.sol";
 
-contract SeamStakingTest is Test, SeamStakingScript {
+contract SeamStakingTest is Test, SeamStaking {
     Seam constant SEAM = Seam(Constants.SEAM_ADDRESS);
 
     IMetaMorphoV1_1 constant SEAMLESS_USDC_VAULT = IMetaMorphoV1_1(Constants.SEAMLESS_USDC_VAULT);
@@ -37,11 +37,11 @@ contract SeamStakingTest is Test, SeamStakingScript {
 
         vm.startPrank(deployer);
 
-        (feeKeeper, stkToken, rewardsController) = SeamStakingScript._deployStakedTokenAndDependencies(deployer);
+        (feeKeeper, stkToken, rewardsController) = SeamStaking._deployStakedTokenAndDependencies(deployer);
 
-        (usdcSplitter, cbbtcSplitter, wethSplitter) = SeamStakingScript._deployFeeSplitters(feeKeeper);
+        (usdcSplitter, cbbtcSplitter, wethSplitter) = SeamStaking._deployFeeSplitters(feeKeeper);
 
-        SeamStakingScript._assignRolesToGovernance(stkToken, feeKeeper, deployer);
+        SeamStaking._assignRolesToGovernance(stkToken, feeKeeper, deployer);
 
         vm.stopPrank();
 
@@ -55,7 +55,7 @@ contract SeamStakingTest is Test, SeamStakingScript {
         SEAMLESS_WETH_VAULT.setFeeRecipient(address(wethSplitter));
     }
 
-    function test_SetupValidation() public {
+    function test_SetupValidation() public view {
         // Validate StakedToken setup
         assertEq(stkToken.name(), "Staked SEAM");
         assertEq(stkToken.symbol(), "stkSEAM");
@@ -176,15 +176,9 @@ contract SeamStakingTest is Test, SeamStakingScript {
         assertEq(curatorWethVaultBalanceAfter - curatorWethVaultBalanceBefore, wethSplitterBalance * 4000 / 10000);
 
         // Check that RewardsController emission rates and distribution end are set correctly
-        _verifyRewardsDistribution(
-            SEAMLESS_USDC_VAULT, curatorUsdcVaultBalanceAfter - curatorUsdcVaultBalanceBefore, usdcSplitterBalance
-        );
-        _verifyRewardsDistribution(
-            SEAMLESS_CBBTC_VAULT, curatorCbbtcVaultBalanceAfter - curatorCbbtcVaultBalanceBefore, cbbtcSplitterBalance
-        );
-        _verifyRewardsDistribution(
-            SEAMLESS_WETH_VAULT, curatorWethVaultBalanceAfter - curatorWethVaultBalanceBefore, wethSplitterBalance
-        );
+        _verifyRewardsDistribution(SEAMLESS_USDC_VAULT, usdcSplitterBalance * 6000 / 10000);
+        _verifyRewardsDistribution(SEAMLESS_CBBTC_VAULT, cbbtcSplitterBalance * 6000 / 10000);
+        _verifyRewardsDistribution(SEAMLESS_WETH_VAULT, wethSplitterBalance * 6000 / 10000);
 
         vm.warp(block.timestamp + 2 days);
 
@@ -193,12 +187,9 @@ contract SeamStakingTest is Test, SeamStakingScript {
         _verifyUserRewards(
             user1,
             user2,
-            usdcSplitterBalance,
-            cbbtcSplitterBalance,
-            wethSplitterBalance,
-            curatorUsdcVaultBalanceAfter - curatorUsdcVaultBalanceBefore,
-            curatorCbbtcVaultBalanceAfter - curatorCbbtcVaultBalanceBefore,
-            curatorWethVaultBalanceAfter - curatorWethVaultBalanceBefore
+            usdcSplitterBalance * 6000 / 10000,
+            cbbtcSplitterBalance * 6000 / 10000,
+            wethSplitterBalance * 6000 / 10000
         );
     }
 
@@ -255,31 +246,25 @@ contract SeamStakingTest is Test, SeamStakingScript {
     function _verifyUserRewards(
         address user1,
         address user2,
-        uint256 usdcSplitterBalance,
-        uint256 cbbtcSplitterBalance,
-        uint256 wethSplitterBalance,
-        uint256 curatorUsdcFee,
-        uint256 curatorCbbtcFee,
-        uint256 curatorWethFee
+        uint256 expectedUSDCFees,
+        uint256 expectedCBTCFees,
+        uint256 expectedWETHFees
     ) internal view {
         // Verify users received rewards proportional to their staked SEAM
-        _verifyUserRewardsForToken(user1, user2, usdcSplitterBalance, curatorUsdcFee, SEAMLESS_USDC_VAULT);
+        _verifyUserRewardsForToken(user1, user2, expectedUSDCFees, SEAMLESS_USDC_VAULT);
 
-        _verifyUserRewardsForToken(user1, user2, cbbtcSplitterBalance, curatorCbbtcFee, SEAMLESS_CBBTC_VAULT);
+        _verifyUserRewardsForToken(user1, user2, expectedCBTCFees, SEAMLESS_CBBTC_VAULT);
 
-        _verifyUserRewardsForToken(user1, user2, wethSplitterBalance, curatorWethFee, SEAMLESS_WETH_VAULT);
+        _verifyUserRewardsForToken(user1, user2, expectedWETHFees, SEAMLESS_WETH_VAULT);
     }
 
-    function _verifyUserRewardsForToken(
-        address user1,
-        address user2,
-        uint256 splitterBalance,
-        uint256 curatorFee,
-        IMetaMorphoV1_1 vault
-    ) internal view {
+    function _verifyUserRewardsForToken(address user1, address user2, uint256 expectedFees, IMetaMorphoV1_1 vault)
+        internal
+        view
+    {
         // Calculate total rewards (splitter balance minus curator fee)
         uint256 period = feeKeeper.getPreviousPeriod();
-        uint256 totalRewards = (splitterBalance - curatorFee) / period;
+        uint256 totalRewards = expectedFees / period;
         totalRewards = totalRewards * period;
 
         // Each user may lose up to 1 wei due to rounding on the RewardsController, so when add them together that makes a max difference of 2 wei
@@ -287,9 +272,7 @@ contract SeamStakingTest is Test, SeamStakingScript {
         assertLe(vault.balanceOf(user1) + vault.balanceOf(user2), totalRewards);
     }
 
-    function _verifyRewardsDistribution(IMetaMorphoV1_1 token, uint256 curatorFeeBalance, uint256 feeSplitterBalance)
-        internal
-    {
+    function _verifyRewardsDistribution(IMetaMorphoV1_1 token, uint256 expectedFees) internal view {
         // Get emission data from RewardsController
         (, uint256 emissionPerSecond,, uint256 distributionEnd) =
             rewardsController.getRewardsData(address(stkToken), address(token));
@@ -303,7 +286,7 @@ contract SeamStakingTest is Test, SeamStakingScript {
         uint256 period = feeKeeper.getPreviousPeriod();
 
         // Calculate expected emission rate (tokens per second)
-        uint256 expectedEmissionRate = (feeSplitterBalance - curatorFeeBalance) / period;
+        uint256 expectedEmissionRate = expectedFees / period;
 
         // Verify exact emission rate
         assertEq(emissionPerSecond, expectedEmissionRate);

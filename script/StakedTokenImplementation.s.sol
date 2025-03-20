@@ -2,10 +2,9 @@
 pragma solidity ^0.8.20;
 
 import "forge-std/Script.sol";
-import {SeamGovernorV2} from "../src/SeamGovernorV2.sol";
-import {Constants} from "../src/library/Constants.sol";
+import {StakedToken} from "../src/StakedToken.sol";
 
-contract SeamGovernorUpgradeV2 is Script {
+contract StakedTokenImplementation is Script {
     function run() public {
         uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
         address deployerAddress = vm.addr(deployerPrivateKey);
@@ -19,7 +18,7 @@ contract SeamGovernorUpgradeV2 is Script {
 
         vm.startBroadcast(deployerPrivateKey);
 
-        SeamGovernorV2 newImplementation = new SeamGovernorV2();
+        StakedToken newImplementation = new StakedToken();
 
         console.log("Deployed new implementation: ", address(newImplementation));
 

@@ -18,6 +18,10 @@ import {VotesUpgradeable} from "openzeppelin-contracts-upgradeable/governance/ut
 import {ERC20PermitUpgradeable} from
     "openzeppelin-contracts-upgradeable/token/ERC20/extensions/ERC20PermitUpgradeable.sol";
 import {PausableUpgradeable} from "openzeppelin-contracts-upgradeable/utils/PausableUpgradeable.sol";
+import {Checkpoints} from "openzeppelin-contracts/utils/structs/Checkpoints.sol";
+import {Math} from "openzeppelin-contracts/utils/math/Math.sol";
+import {SafeCast} from "openzeppelin-contracts/utils/math/SafeCast.sol";
+import {IVotes} from "openzeppelin-contracts/governance/utils/IVotes.sol";
 
 /**
  * @title StakedToken
@@ -112,6 +116,7 @@ contract StakedToken is
     /// @inheritdoc IStakedToken
     function emergencyWithdrawal(address to, uint256 amt) external override onlyRole(MANAGER_ROLE) {
         SafeERC20.safeTransfer(IERC20(asset()), to, amt);
+        _updateAssetBalanceCheckpoints();
         emit EmergencyWithdraw(to, amt);
     }
 
@@ -184,6 +189,7 @@ contract StakedToken is
     {
         _validateCooldown(owner);
         super._withdraw(caller, receiver, owner, assets, shares);
+        _updateAssetBalanceCheckpoints();
     }
 
     /**
@@ -201,6 +207,7 @@ contract StakedToken is
         whenNotPaused
     {
         super._deposit(caller, receiver, assets, shares);
+        _updateAssetBalanceCheckpoints();
     }
 
     /**
@@ -271,7 +278,6 @@ contract StakedToken is
         internal
         override(ERC20Upgradeable, ERC20VotesUpgradeable)
     {
-        StorageLayout storage $ = storageLayout();
         // save to local for gas efficiency
         // Can remove if we block any transfer during CD
         uint256 balFrom = balanceOf(from);
@@ -287,6 +293,8 @@ contract StakedToken is
 
         // Recipient
         if (from != to) {
+            StorageLayout storage $ = storageLayout();
+
             uint256 previousSenderCooldown = $.stakersCooldowns[from];
             $.stakersCooldowns[to] = getNextCooldownTimestamp(previousSenderCooldown, value, to, balTo);
             // if cooldown was set and whole balance of sender was transferred - clear cooldown
@@ -346,5 +354,51 @@ contract StakedToken is
     /// @inheritdoc IStakedToken
     function getRewardsController() public view override returns (IRewardsController rewardController) {
         rewardController = storageLayout().rewardsController;
+    }
+
+    /// @dev updates the asset balance checkpoints
+    function _updateAssetBalanceCheckpoints() internal {
+        Checkpoints.push(storageLayout().assetBalanceCheckpoints, clock(), SafeCast.toUint208(totalAssets()));
+    }
+
+    /// @inheritdoc IVotes
+    function getVotes(address account) public view override returns (uint256) {
+        uint256 votingUnits = super.getVotes(account);
+        uint256 assetBalance = Checkpoints.latest(storageLayout().assetBalanceCheckpoints);
+        uint256 totalSupply = _getTotalSupply();
+
+        if (totalSupply == 0) {
+            return 0;
+        }
+
+        // Virtual shares not needed for voting power
+        return Math.mulDiv(votingUnits, assetBalance, totalSupply, Math.Rounding.Floor);
+    }
+
+    /// @inheritdoc IVotes
+    function getPastVotes(address account, uint256 timepoint) public view override returns (uint256) {
+        uint256 votingUnits = super.getPastVotes(account, timepoint);
+        uint256 totalSupply = getPastTotalSupply(timepoint);
+        uint256 assetBalance = getPastAssetBalance(timepoint);
+
+        if (totalSupply == 0) {
+            return 0;
+        }
+
+        // Virtual shares not needed for voting power
+        return Math.mulDiv(votingUnits, assetBalance, totalSupply, Math.Rounding.Floor);
+    }
+
+    /**
+     * @dev Returns the asset balance at a given timepoint.
+     * Assets that were not transfered through ERC4626 methods or emergencyWithdrawal
+     * are not checkpointed until the next time one of those operations is performed.
+     */
+    function getPastAssetBalance(uint256 timepoint) public view returns (uint256) {
+        uint48 currentTimepoint = clock();
+        if (timepoint >= currentTimepoint) {
+            revert ERC5805FutureLookup(timepoint, currentTimepoint);
+        }
+        return Checkpoints.upperLookupRecent(storageLayout().assetBalanceCheckpoints, SafeCast.toUint48(timepoint));
     }
 }
